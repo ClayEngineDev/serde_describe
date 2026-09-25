@@ -4,3 +4,4 @@ pub(crate) mod fast_paths;
 pub(crate) mod helpers;
 pub(crate) mod roundtrip;
 pub(crate) mod stress;
+pub(crate) mod tagged_enums;

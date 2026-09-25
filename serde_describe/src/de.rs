@@ -896,6 +896,26 @@ where
                     .variant_name(variant)
                     .map_err(Self::Error::custom)?,
             ),
+            // Tagged enums (`#[serde(tag = ...)]`) read the tag *value* as a variant identifier,
+            // and that value is a plain scalar node with no variant name. Forward scalars to
+            // `deserialize_any`: `String` reaches `visit_str` and numbers reach `visit_u*`, both of
+            // which serde's identifier visitors accept.
+            SchemaNode::Bool
+            | SchemaNode::I8
+            | SchemaNode::I16
+            | SchemaNode::I32
+            | SchemaNode::I64
+            | SchemaNode::I128
+            | SchemaNode::U8
+            | SchemaNode::U16
+            | SchemaNode::U32
+            | SchemaNode::U64
+            | SchemaNode::U128
+            | SchemaNode::F32
+            | SchemaNode::F64
+            | SchemaNode::Char
+            | SchemaNode::String
+            | SchemaNode::Bytes => self.deserialize_any(visitor),
             _ => self.invalid_type_error(&visitor),
         }
     }
