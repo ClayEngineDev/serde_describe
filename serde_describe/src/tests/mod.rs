@@ -6,3 +6,4 @@ pub(crate) mod raw_seq;
 pub(crate) mod roundtrip;
 pub(crate) mod stress;
 pub(crate) mod tagged_enums;
+pub(crate) mod untagged_flatten;
