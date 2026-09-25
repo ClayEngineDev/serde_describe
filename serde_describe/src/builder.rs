@@ -140,6 +140,7 @@ impl SchemaBuilder {
             variant_names: self.variant_names.into(),
             type_names: self.type_names.into(),
             seq_memo: Default::default(),
+            fixed_shape_memo: Default::default(),
         };
         Ok(schema)
     }

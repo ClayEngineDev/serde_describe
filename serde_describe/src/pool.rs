@@ -107,6 +107,12 @@ where
             self.values.get(index.into() - 1).map(Borrow::borrow)
         }
     }
+
+    /// The stored values, in index order starting at index 1 (index 0 is the empty value).
+    #[inline]
+    pub(crate) fn values(&self) -> &[ValueT] {
+        &self.values
+    }
 }
 
 impl<FromT, IntoT, ValueIndexT> From<Pool<FromT, ValueIndexT>> for ReadonlyPool<IntoT, ValueIndexT>

@@ -32,6 +32,24 @@ pub struct Schema {
     pub(crate) variant_names: ReadonlyNonEmptyPool<Box<str>, VariantNameIndex>,
     pub(crate) type_names: ReadonlyNonEmptyPool<Box<str>, TypeNameIndex>,
     pub(crate) seq_memo: SeqMemo,
+    pub(crate) fixed_shape_memo: FixedShapeMemo,
+}
+
+/// Per node memo of [`Schema::is_fixed_shape`]: `0` = unknown, `1` = fixed, `2` = not fixed.
+/// Only a cache, so cloning a schema starts it empty.
+#[derive(Default)]
+pub(crate) struct FixedShapeMemo(std::sync::OnceLock<Box<[std::sync::atomic::AtomicU8]>>);
+
+impl Clone for FixedShapeMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for FixedShapeMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FixedShapeMemo")
+    }
 }
 
 /// Per field-name-list memo of "these names equal a target's `&'static [&'static str]` field
@@ -53,6 +71,73 @@ impl std::fmt::Debug for SeqMemo {
 }
 
 impl Schema {
+    /// Whether every value described by node `index` is encoded exactly as a plain
+    /// (non-described) serialization of it would be, with a shape that doesn't depend on the
+    /// value: numbers, strings, bytes, units, and tuples / newtypes / structs without skippable
+    /// or never-serialized fields made only of those. Enums, options (unions) and collections
+    /// (whose items may go unvisited in an empty instance) are excluded.
+    pub(crate) fn is_fixed_shape(&self, index: SchemaNodeIndex) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let memo = self.fixed_shape_memo.0.get_or_init(|| {
+            (0..=self.nodes.values().len())
+                .map(|_| Default::default())
+                .collect()
+        });
+        let Some(slot) = memo.get(usize::from(index)) else {
+            return false;
+        };
+        match slot.load(Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        let fixed = self.compute_fixed_shape(index, 0);
+        slot.store(if fixed { 1 } else { 2 }, Relaxed);
+        fixed
+    }
+
+    fn compute_fixed_shape(&self, index: SchemaNodeIndex, depth: u32) -> bool {
+        // Finite values can't recurse without going through an option or a collection, but
+        // don't trust a (possibly corrupt) schema on that.
+        if depth > 64 || index.is_empty() {
+            return false;
+        }
+        let Ok(node) = self.node(index) else {
+            return false;
+        };
+        let list_fixed = |list: SchemaNodeListIndex| {
+            self.node_list(list).is_ok_and(|items| {
+                items
+                    .iter()
+                    .all(|&item| self.compute_fixed_shape(item, depth + 1))
+            })
+        };
+        match node {
+            SchemaNode::Bool
+            | SchemaNode::I8
+            | SchemaNode::I16
+            | SchemaNode::I32
+            | SchemaNode::I64
+            | SchemaNode::I128
+            | SchemaNode::U8
+            | SchemaNode::U16
+            | SchemaNode::U32
+            | SchemaNode::U64
+            | SchemaNode::U128
+            | SchemaNode::F32
+            | SchemaNode::F64
+            | SchemaNode::Char
+            | SchemaNode::String
+            | SchemaNode::Bytes
+            | SchemaNode::Unit
+            | SchemaNode::UnitStruct(_) => true,
+            SchemaNode::NewtypeStruct(_, inner) => self.compute_fixed_shape(inner, depth + 1),
+            SchemaNode::Tuple(list) | SchemaNode::TupleStruct(_, list) => list_fixed(list),
+            SchemaNode::Struct(_, _, skip_list, list) => skip_list.is_empty() && list_fixed(list),
+            _ => false,
+        }
+    }
+
     /// Whether the field-name list `list` is exactly `fields` (same names, same order).
     #[inline]
     pub(crate) fn field_names_match(
@@ -460,6 +545,7 @@ impl<'de> Deserialize<'de> for Schema {
                 variant_names,
                 type_names,
                 seq_memo: SeqMemo::default(),
+                fixed_shape_memo: FixedShapeMemo::default(),
             }),
         }
     }

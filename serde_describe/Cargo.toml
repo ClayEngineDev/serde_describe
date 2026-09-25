@@ -27,3 +27,12 @@ serde_bytes.workspace = true
 # matching. Requires every visitor reached through `deserialize_struct` to implement
 # `visit_seq` (serde-derived visitors do; hand-written map-only visitors would fail).
 positional-structs = []
+# Decode the elements of a sequence straight through the inner deserializer, skipping the schema
+# layer, once the first element proved the target type matches the schema exactly. Only applies
+# when the element schema has a fixed shape (numbers, strings, bytes, units, tuples, newtypes and
+# structs with no skippable fields; no enums, options or nested collections), where the
+# self-described wire format is identical to the plain one, and only for non-human-readable
+# inner formats that encode structs like tuples (bitcode, postcard, bincode). Assumes a target
+# type decodes every element through the same sequence of `Deserializer` calls, which holds for
+# derived and ordinary hand-written implementations.
+raw-seq-elements = []

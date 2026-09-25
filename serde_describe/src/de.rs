@@ -20,6 +20,83 @@ use crate::{
     schema::SchemaNode,
 };
 
+/// Tracks whether the element being probed by a [`SchemaSeqDeserializer`] decoded through
+/// exact calls only, see the `raw-seq-elements` feature. Every schema-layer path that does
+/// anything other than forward the target's call unchanged to the inner deserializer calls
+/// [`probe::mark_inexact`].
+mod probe {
+    use std::{
+        cell::Cell,
+        sync::atomic::{AtomicUsize, Ordering::Relaxed},
+    };
+
+    const OFF: u8 = 0;
+    const CLEAN: u8 = 1;
+    const DIRTY: u8 = 2;
+
+    thread_local! {
+        static STATE: Cell<u8> = const { Cell::new(OFF) };
+    }
+
+    /// Probes in progress on any thread. Lets [`mark_inexact`] skip the thread-local access,
+    /// which is measurable on union-heavy data, while no probe runs anywhere.
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Whether any probe runs on any thread; when not, nothing needs to be recorded.
+    #[inline]
+    pub(crate) fn active() -> bool {
+        cfg!(feature = "raw-seq-elements") && ACTIVE.load(Relaxed) != 0
+    }
+
+    #[inline]
+    pub(crate) fn mark_inexact() {
+        if active() {
+            STATE.with(|state| {
+                if state.get() == CLEAN {
+                    state.set(DIRTY);
+                }
+            });
+        }
+    }
+
+    /// An in-progress probe. Restores the enclosing probe's state when dropped, also on unwind.
+    pub(crate) struct Probe {
+        enclosing: u8,
+    }
+
+    impl Probe {
+        #[inline]
+        pub(crate) fn begin() -> Self {
+            ACTIVE.fetch_add(1, Relaxed);
+            Self {
+                enclosing: STATE.with(|state| state.replace(CLEAN)),
+            }
+        }
+
+        /// Whether every call made since [`Self::begin`] was exact.
+        #[inline]
+        pub(crate) fn finish(self) -> bool {
+            STATE.with(|state| state.get() == CLEAN)
+        }
+    }
+
+    impl Drop for Probe {
+        #[inline]
+        fn drop(&mut self) {
+            STATE.with(|state| {
+                // An inexact nested probe also makes the enclosing one inexact.
+                let clean = state.get() == CLEAN;
+                state.set(if self.enclosing == OFF || clean {
+                    self.enclosing
+                } else {
+                    DIRTY
+                });
+            });
+            ACTIVE.fetch_sub(1, Relaxed);
+        }
+    }
+}
+
 impl<'de, T> Deserialize<'de> for SelfDescribed<T>
 where
     T: Deserialize<'de>,
@@ -171,12 +248,16 @@ where
     where
         VisitorT: serde::de::Visitor<'de>,
     {
+        // Whether elements may go raw is settled in `visit_seq`, once the length is known.
+        let may_go_raw = cfg!(feature = "raw-seq-elements") && !self.inner.is_human_readable();
         self.inner.deserialize_seq(SchemaSeqDeserializer {
             schema: self.schema,
             item: self
                 .schema
                 .node(item)
                 .map_err(DeserializerT::Error::custom)?,
+            item_index: item,
+            may_go_raw,
             inner: visitor,
         })
     }
@@ -270,6 +351,7 @@ where
                 );
             }
         }
+        probe::mark_inexact();
         let field_types = schema
             .node_list(field_types)
             .map_err(DeserializerT::Error::custom)?;
@@ -330,7 +412,10 @@ where
             SchemaNode::Union(variants) => self.deserialize_union(variants, call),
             SchemaNode::OptionSome(inner)
             | SchemaNode::NewtypeStruct(_, inner)
-            | SchemaNode::NewtypeVariant(_, _, inner) => call.call(self.forward(inner)?),
+            | SchemaNode::NewtypeVariant(_, _, inner) => {
+                probe::mark_inexact();
+                call.call(self.forward(inner)?)
+            }
             _ => self.invalid_type_error(&call),
         }
     }
@@ -416,6 +501,7 @@ where
         f32: LosslessCast<CallT::CanonicalInput>,
         f64: LosslessCast<CallT::CanonicalInput>,
     {
+        probe::mark_inexact();
         self.deserialize_number(call)
     }
 
@@ -483,6 +569,23 @@ where
         .deserialize(self.inner)
     }
 
+    /// Tuples are exact when the node is a tuple of exactly the requested length.
+    #[inline]
+    fn probe_tuple(&self, len: usize) {
+        if probe::active() {
+            let exact = match self.node {
+                SchemaNode::Tuple(list) | SchemaNode::TupleStruct(_, list) => self
+                    .schema
+                    .node_list(list)
+                    .is_ok_and(|list| list.len() == len),
+                _ => false,
+            };
+            if !exact {
+                probe::mark_inexact();
+            }
+        }
+    }
+
     fn unexpected(self) -> Result<Unexpected<'de>, DeserializerT::Error> {
         Ok(match self.node {
             SchemaNode::Bool => Unexpected::Bool(bool::deserialize(self.inner)?),
@@ -537,6 +640,7 @@ where
         self,
         expected: &dyn Expected,
     ) -> Result<ExpectedT, DeserializerT::Error> {
+        probe::mark_inexact();
         Err(DeserializerT::Error::invalid_type(
             self.unexpected()?,
             expected,
@@ -589,6 +693,7 @@ where
     where
         V: serde::de::Visitor<'de>,
     {
+        probe::mark_inexact();
         match self.node {
             SchemaNode::Bool => self.inner.deserialize_bool(visitor),
 
@@ -674,7 +779,10 @@ where
             SchemaNode::Union(variants) => {
                 self.deserialize_union(variants, deferred::deserialize_option { visitor })
             }
-            _ => visitor.visit_some(self),
+            _ => {
+                probe::mark_inexact();
+                visitor.visit_some(self)
+            }
         }
     }
 
@@ -706,12 +814,18 @@ where
                 deferred::deserialize_newtype_struct { name, visitor },
             ),
             SchemaNode::NewtypeVariant(_, _, inner) => {
+                probe::mark_inexact();
                 visitor.visit_newtype_struct(self.forward(inner)?)
             }
-            SchemaNode::OptionSome(inner) => self
-                .forward(inner)?
-                .deserialize_newtype_struct(name, visitor),
-            _ => visitor.visit_newtype_struct(self),
+            SchemaNode::OptionSome(inner) => {
+                probe::mark_inexact();
+                self.forward(inner)?
+                    .deserialize_newtype_struct(name, visitor)
+            }
+            _ => {
+                probe::mark_inexact();
+                visitor.visit_newtype_struct(self)
+            }
         }
     }
 
@@ -719,6 +833,8 @@ where
     where
         V: serde::de::Visitor<'de>,
     {
+        // Sequences and unions never occur inside fixed-shape elements (see
+        // `Schema::is_fixed_shape`), so only the conversions below need to report to a probe.
         match self.node {
             SchemaNode::Sequence(item) => self.do_deserialize_seq(item, visitor),
             SchemaNode::Union(variants) => {
@@ -728,12 +844,16 @@ where
             SchemaNode::Tuple(field_types)
             | SchemaNode::TupleStruct(_, field_types)
             | SchemaNode::TupleVariant(_, _, field_types) => {
+                probe::mark_inexact();
                 self.do_deserialize_tuple(field_types, visitor)
             }
 
             SchemaNode::NewtypeStruct(_, inner)
             | SchemaNode::NewtypeVariant(_, _, inner)
-            | SchemaNode::OptionSome(inner) => self.forward(inner)?.deserialize_seq(visitor),
+            | SchemaNode::OptionSome(inner) => {
+                probe::mark_inexact();
+                self.forward(inner)?.deserialize_seq(visitor)
+            }
 
             _ => self.invalid_type_error(&visitor),
         }
@@ -743,6 +863,7 @@ where
     where
         V: serde::de::Visitor<'de>,
     {
+        self.probe_tuple(len);
         match self.node {
             SchemaNode::Tuple(field_types) => self.do_deserialize_tuple(field_types, visitor),
 
@@ -772,6 +893,7 @@ where
     where
         V: serde::de::Visitor<'de>,
     {
+        self.probe_tuple(len);
         match self.node {
             SchemaNode::TupleStruct(_, field_types) => {
                 self.do_deserialize_tuple(field_types, visitor)
@@ -805,10 +927,14 @@ where
 
             SchemaNode::NewtypeStruct(_, inner)
             | SchemaNode::NewtypeVariant(_, _, inner)
-            | SchemaNode::OptionSome(inner) => self.forward(inner)?.deserialize_map(visitor),
+            | SchemaNode::OptionSome(inner) => {
+                probe::mark_inexact();
+                self.forward(inner)?.deserialize_map(visitor)
+            }
 
             SchemaNode::Struct(_, field_names, skip_list, field_types)
             | SchemaNode::StructVariant(_, _, field_names, skip_list, field_types) => {
+                // Not `target_fields`, so this takes the (marking) by-name path.
                 self.do_deserialize_struct(field_names, skip_list, field_types, None, visitor)
             }
 
@@ -843,11 +969,16 @@ where
 
             SchemaNode::NewtypeStruct(_, inner)
             | SchemaNode::NewtypeVariant(_, _, inner)
-            | SchemaNode::OptionSome(inner) => self
-                .forward(inner)?
-                .deserialize_struct(name, fields, visitor),
+            | SchemaNode::OptionSome(inner) => {
+                probe::mark_inexact();
+                self.forward(inner)?
+                    .deserialize_struct(name, fields, visitor)
+            }
 
-            SchemaNode::Map(key, value) => self.do_deserialize_map(key, value, visitor),
+            SchemaNode::Map(key, value) => {
+                probe::mark_inexact();
+                self.do_deserialize_map(key, value, visitor)
+            }
 
             _ => self.invalid_type_error(&visitor),
         }
@@ -872,11 +1003,16 @@ where
                 },
             ),
 
-            SchemaNode::NewtypeStruct(_, inner) | SchemaNode::OptionSome(inner) => self
-                .forward(inner)?
-                .deserialize_enum(name, variants, visitor),
+            SchemaNode::NewtypeStruct(_, inner) | SchemaNode::OptionSome(inner) => {
+                probe::mark_inexact();
+                self.forward(inner)?
+                    .deserialize_enum(name, variants, visitor)
+            }
 
-            _ => visitor.visit_enum(self),
+            _ => {
+                probe::mark_inexact();
+                visitor.visit_enum(self)
+            }
         }
     }
 
@@ -884,6 +1020,8 @@ where
     where
         V: serde::de::Visitor<'de>,
     {
+        // Scalars reach a probe through `deserialize_any`, mismatches through
+        // `invalid_type_error`; the other nodes never occur inside fixed-shape elements.
         match self.node {
             SchemaNode::Union(variants) => {
                 self.deserialize_union(variants, deferred::deserialize_identifier { visitor })
@@ -1001,8 +1139,14 @@ where
 pub struct SchemaSeqDeserializer<'schema, InnerT> {
     schema: &'schema Schema,
     item: SchemaNode,
+    item_index: SchemaNodeIndex,
+    /// Whether [`ProbedSeqAccess`] may be used, see `raw-seq-elements`.
+    may_go_raw: bool,
     inner: InnerT,
 }
+
+/// Shorter sequences always decode through the schema layer: probing costs more than it saves.
+const RAW_ELEMENTS_MIN_LEN: usize = 16;
 
 impl<'schema, 'de, VisitorT> serde::de::Visitor<'de> for SchemaSeqDeserializer<'schema, VisitorT>
 where
@@ -1018,11 +1162,29 @@ where
     where
         A: SeqAccess<'de>,
     {
-        self.inner.visit_seq(SchemaSeqDeserializer {
-            schema: self.schema,
-            item: self.item,
-            inner: seq,
-        })
+        // A separate `SeqAccess` type rather than a mode of this one: extra paths in this
+        // `next_element_seed` slow down every other sequence, even when never taken.
+        if self.may_go_raw
+            && seq
+                .size_hint()
+                .is_some_and(|len| len >= RAW_ELEMENTS_MIN_LEN)
+            && self.schema.is_fixed_shape(self.item_index)
+        {
+            self.inner.visit_seq(ProbedSeqAccess {
+                schema: self.schema,
+                item: self.item,
+                raw: RawElements::Probe,
+                inner: seq,
+            })
+        } else {
+            self.inner.visit_seq(SchemaSeqDeserializer {
+                schema: self.schema,
+                item: self.item,
+                item_index: self.item_index,
+                may_go_raw: false,
+                inner: seq,
+            })
+        }
     }
 }
 
@@ -1045,6 +1207,82 @@ where
 
     fn size_hint(&self) -> Option<usize> {
         self.inner.size_hint()
+    }
+}
+
+/// Whether a [`ProbedSeqAccess`] decodes elements through the schema layer or straight through
+/// the inner deserializer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawElements {
+    /// Always through the schema layer.
+    Never,
+    /// Decode the next element through the schema layer while checking it only made exact
+    /// calls; if so, decode the rest raw.
+    Probe,
+    /// Straight through the inner deserializer.
+    Raw,
+}
+
+/// The elements of a long sequence of fixed-shape elements (`raw-seq-elements`): the first one
+/// decodes through the schema layer; if that only forwarded the target's calls unchanged, the
+/// rest decode straight through the inner deserializer, as in a plain non-described decode.
+struct ProbedSeqAccess<'schema, InnerT> {
+    schema: &'schema Schema,
+    item: SchemaNode,
+    raw: RawElements,
+    inner: InnerT,
+}
+
+impl<'schema, 'de, SeqAccessT> SeqAccess<'de> for ProbedSeqAccess<'schema, SeqAccessT>
+where
+    SeqAccessT: SeqAccess<'de>,
+{
+    type Error = SeqAccessT::Error;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        if self.raw == RawElements::Raw {
+            self.inner.next_element_seed(seed)
+        } else {
+            self.next_described(seed)
+        }
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        self.inner.size_hint()
+    }
+}
+
+impl<'schema, 'de, SeqAccessT> ProbedSeqAccess<'schema, SeqAccessT>
+where
+    SeqAccessT: SeqAccess<'de>,
+{
+    /// The next element through the schema layer, probing it if still undecided. Out of line to
+    /// keep the raw per-element path small.
+    #[inline(never)]
+    fn next_described<T>(&mut self, seed: T) -> Result<Option<T::Value>, SeqAccessT::Error>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        let wrapped = SchemaDeserializer {
+            schema: self.schema,
+            node: self.item,
+            inner: seed,
+        };
+        if self.raw == RawElements::Never {
+            return self.inner.next_element_seed(wrapped);
+        }
+        let probe = probe::Probe::begin();
+        let element = self.inner.next_element_seed(wrapped);
+        let exact = probe.finish();
+        self.raw = match element {
+            Ok(Some(_)) if exact => RawElements::Raw,
+            Ok(None) => RawElements::Probe,
+            _ => RawElements::Never,
+        };
+        element
     }
 }
 
