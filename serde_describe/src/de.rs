@@ -372,6 +372,26 @@ where
         }
     }
 
+    #[inline(never)]
+    fn deserialize_number_slow<CallT>(self, call: CallT) -> CallResult<'de, CallT, DeserializerT>
+    where
+        CallT: CanonicalVisit<'de>,
+        u8: LosslessCast<CallT::CanonicalInput>,
+        u16: LosslessCast<CallT::CanonicalInput>,
+        u32: LosslessCast<CallT::CanonicalInput>,
+        u64: LosslessCast<CallT::CanonicalInput>,
+        u128: LosslessCast<CallT::CanonicalInput>,
+        i8: LosslessCast<CallT::CanonicalInput>,
+        i16: LosslessCast<CallT::CanonicalInput>,
+        i32: LosslessCast<CallT::CanonicalInput>,
+        i64: LosslessCast<CallT::CanonicalInput>,
+        i128: LosslessCast<CallT::CanonicalInput>,
+        f32: LosslessCast<CallT::CanonicalInput>,
+        f64: LosslessCast<CallT::CanonicalInput>,
+    {
+        self.deserialize_number(call)
+    }
+
     #[inline]
     fn deserialize_union<CallT>(
         self,
@@ -506,6 +526,22 @@ macro_rules! deserialize_simple {
         deserialize_simple!{@helper, $fn_name, self, visitor, (self.deserialize_number(deferred::$fn_name { visitor }))}
     };
 
+    // Exact schema match forwards straight to the inner deserializer (what a plain,
+    // non-described decode would do); everything else takes the out-of-line generic path.
+    ($fn_name:ident, @fast $exact:pat, $slow:ident) => {
+        #[inline]
+        fn $fn_name<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: serde::de::Visitor<'de>,
+        {
+            if matches!(self.node, $exact) {
+                self.inner.$fn_name(visitor)
+            } else {
+                self.$slow(deferred::$fn_name { visitor })
+            }
+        }
+    };
+
     (@helper, $fn_name:ident, $self:ident, $visitor:ident, $with:tt) => {
         fn $fn_name<V>($self, $visitor: V) -> Result<V::Value, Self::Error>
         where
@@ -578,18 +614,18 @@ where
     }
 
     deserialize_simple! { deserialize_bool, SchemaNode::Bool }
-    deserialize_simple! { deserialize_i8, @number }
-    deserialize_simple! { deserialize_i16, @number }
-    deserialize_simple! { deserialize_i32, @number }
-    deserialize_simple! { deserialize_i64, @number }
-    deserialize_simple! { deserialize_i128, @number }
-    deserialize_simple! { deserialize_u8, @number }
-    deserialize_simple! { deserialize_u16, @number }
-    deserialize_simple! { deserialize_u32, @number }
-    deserialize_simple! { deserialize_u64, @number }
-    deserialize_simple! { deserialize_u128, @number }
-    deserialize_simple! { deserialize_f32, @number }
-    deserialize_simple! { deserialize_f64, @number }
+    deserialize_simple! { deserialize_i8, @fast SchemaNode::I8, deserialize_number_slow }
+    deserialize_simple! { deserialize_i16, @fast SchemaNode::I16, deserialize_number_slow }
+    deserialize_simple! { deserialize_i32, @fast SchemaNode::I32, deserialize_number_slow }
+    deserialize_simple! { deserialize_i64, @fast SchemaNode::I64, deserialize_number_slow }
+    deserialize_simple! { deserialize_i128, @fast SchemaNode::I128, deserialize_number_slow }
+    deserialize_simple! { deserialize_u8, @fast SchemaNode::U8, deserialize_number_slow }
+    deserialize_simple! { deserialize_u16, @fast SchemaNode::U16, deserialize_number_slow }
+    deserialize_simple! { deserialize_u32, @fast SchemaNode::U32, deserialize_number_slow }
+    deserialize_simple! { deserialize_u64, @fast SchemaNode::U64, deserialize_number_slow }
+    deserialize_simple! { deserialize_u128, @fast SchemaNode::U128, deserialize_number_slow }
+    deserialize_simple! { deserialize_f32, @fast SchemaNode::F32, deserialize_number_slow }
+    deserialize_simple! { deserialize_f64, @fast SchemaNode::F64, deserialize_number_slow }
     deserialize_simple! { deserialize_char, SchemaNode::Char }
 
     deserialize_simple! { deserialize_str, SchemaNode::String }
