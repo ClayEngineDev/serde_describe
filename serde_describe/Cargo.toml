@@ -20,3 +20,10 @@ maplit.workspace = true
 postcard.workspace = true
 ron.workspace = true
 serde_bytes.workspace = true
+
+[features]
+# Decode structs whose written fields exactly match the target's declared fields (same
+# names, same order, none skipped) positionally via `visit_seq`, skipping per-field name
+# matching. Requires every visitor reached through `deserialize_struct` to implement
+# `visit_seq` (serde-derived visitors do; hand-written map-only visitors would fail).
+positional-structs = []

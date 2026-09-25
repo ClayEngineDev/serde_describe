@@ -139,6 +139,7 @@ impl SchemaBuilder {
             field_names: self.field_names.into(),
             variant_names: self.variant_names.into(),
             type_names: self.type_names.into(),
+            seq_memo: Default::default(),
         };
         Ok(schema)
     }

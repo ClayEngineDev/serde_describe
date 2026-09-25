@@ -139,6 +139,11 @@ where
     pub(crate) fn get(&self, index: ValueIndexT) -> Option<&ValueT> {
         self.values.get(index.into())
     }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.values.len()
+    }
 }
 
 impl<FromT, IntoT, ValueIndexT> From<NonEmptyPool<FromT, ValueIndexT>>

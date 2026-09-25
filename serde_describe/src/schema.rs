@@ -31,9 +31,59 @@ pub struct Schema {
     pub(crate) field_names: ReadonlyNonEmptyPool<Box<str>, FieldNameIndex>,
     pub(crate) variant_names: ReadonlyNonEmptyPool<Box<str>, VariantNameIndex>,
     pub(crate) type_names: ReadonlyNonEmptyPool<Box<str>, TypeNameIndex>,
+    pub(crate) seq_memo: SeqMemo,
+}
+
+/// Per field-name-list memo of "these names equal a target's `&'static [&'static str]` field
+/// list, in order". One entry per list: `ptr | 1` = matches, `ptr` = doesn't, `0` = unknown.
+/// Only a cache, so cloning a schema starts it empty.
+#[derive(Default)]
+pub(crate) struct SeqMemo(std::sync::OnceLock<Box<[std::sync::atomic::AtomicUsize]>>);
+
+impl Clone for SeqMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for SeqMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SeqMemo")
+    }
 }
 
 impl Schema {
+    /// Whether the field-name list `list` is exactly `fields` (same names, same order).
+    #[inline]
+    pub(crate) fn field_names_match(
+        &self,
+        list: FieldNameListIndex,
+        names: &[FieldNameIndex],
+        fields: &'static [&'static str],
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let key = fields.as_ptr() as usize;
+        let memo = self.seq_memo.0.get_or_init(|| {
+            (0..self.field_name_lists.len())
+                .map(|_| Default::default())
+                .collect()
+        });
+        let Some(slot) = memo.get(usize::from(list)) else {
+            return false;
+        };
+        let cached = slot.load(Relaxed);
+        if cached & !1 == key {
+            return cached & 1 == 1;
+        }
+        let matches = names.len() == fields.len()
+            && names
+                .iter()
+                .zip(fields)
+                .all(|(&name, field)| self.field_name(name).is_ok_and(|name| name == *field));
+        slot.store(key | usize::from(matches), Relaxed);
+        matches
+    }
+
     /// Deserializes a value that was previously serialized with [`Self::describe_trace`].
     ///
     /// If you don't need a shared schema, use the much simpler [`crate::SelfDescribed`] wrapper
@@ -409,6 +459,7 @@ impl<'de> Deserialize<'de> for Schema {
                 field_names,
                 variant_names,
                 type_names,
+                seq_memo: SeqMemo::default(),
             }),
         }
     }

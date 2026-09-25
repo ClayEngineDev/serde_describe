@@ -234,15 +234,42 @@ where
         field_names: FieldNameListIndex,
         skip_list: MemberListIndex,
         field_types: SchemaNodeListIndex,
+        target_fields: Option<&'static [&'static str]>,
         visitor: VisitorT,
     ) -> Result<VisitorT::Value, DeserializerT::Error>
     where
         VisitorT: serde::de::Visitor<'de>,
     {
         let schema = self.schema;
+        let field_names_index = field_names;
         let field_names = schema
             .field_name_list(field_names)
             .map_err(DeserializerT::Error::custom)?;
+
+        // Opt-in fast path (`positional-structs`): the written fields are exactly the target's
+        // fields, in order, none skipped. Requires every visitor reached through
+        // `deserialize_struct` to implement `visit_seq` (serde-derived ones do; hand-written
+        // map-only visitors would fail with "invalid type: sequence"). Skipped when off. The struct is then just a tuple to the target, as in a plain non-described
+        // decode, and the visitor's positional `visit_seq` avoids per-field name matching.
+        if cfg!(feature = "positional-structs")
+            && let Some(target_fields) = target_fields
+            && skip_list.is_empty()
+            && schema.field_names_match(field_names_index, field_names, target_fields)
+        {
+            let items = schema
+                .node_list(field_types)
+                .map_err(DeserializerT::Error::custom)?;
+            if items.len() == field_names.len() && !items.iter().any(|item| item.is_empty()) {
+                return self.inner.deserialize_tuple(
+                    items.len(),
+                    SchemaTupleDeserializer {
+                        schema,
+                        items,
+                        inner: visitor,
+                    },
+                );
+            }
+        }
         let field_types = schema
             .node_list(field_types)
             .map_err(DeserializerT::Error::custom)?;
@@ -605,7 +632,7 @@ where
             }
             SchemaNode::Struct(_, field_names, skip_list, field_types)
             | SchemaNode::StructVariant(_, _, field_names, skip_list, field_types) => {
-                self.do_deserialize_struct(field_names, skip_list, field_types, visitor)
+                self.do_deserialize_struct(field_names, skip_list, field_types, None, visitor)
             }
             SchemaNode::Union(variants) => {
                 self.deserialize_union(variants, deferred::deserialize_any { visitor })
@@ -782,7 +809,7 @@ where
 
             SchemaNode::Struct(_, field_names, skip_list, field_types)
             | SchemaNode::StructVariant(_, _, field_names, skip_list, field_types) => {
-                self.do_deserialize_struct(field_names, skip_list, field_types, visitor)
+                self.do_deserialize_struct(field_names, skip_list, field_types, None, visitor)
             }
 
             _ => self.invalid_type_error(&visitor),
@@ -799,9 +826,8 @@ where
         V: serde::de::Visitor<'de>,
     {
         match self.node {
-            SchemaNode::Struct(_, field_names, skip_list, field_types) => {
-                self.do_deserialize_struct(field_names, skip_list, field_types, visitor)
-            }
+            SchemaNode::Struct(_, field_names, skip_list, field_types) => self
+                .do_deserialize_struct(field_names, skip_list, field_types, Some(fields), visitor),
 
             SchemaNode::Union(variants) => self.deserialize_union(
                 variants,
@@ -812,9 +838,8 @@ where
                 },
             ),
 
-            SchemaNode::StructVariant(_, _, field_names, skip_list, field_types) => {
-                self.do_deserialize_struct(field_names, skip_list, field_types, visitor)
-            }
+            SchemaNode::StructVariant(_, _, field_names, skip_list, field_types) => self
+                .do_deserialize_struct(field_names, skip_list, field_types, Some(fields), visitor),
 
             SchemaNode::NewtypeStruct(_, inner)
             | SchemaNode::NewtypeVariant(_, _, inner)
