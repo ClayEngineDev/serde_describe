@@ -2,8 +2,9 @@ use std::fmt::Debug;
 
 use crate::{
     indices::{
-        FieldNameIndex, FieldNameListIndex, MemberIndex, MemberListIndex, SchemaNodeIndex,
-        SchemaNodeListIndex, TraceIndex, TypeName, TypeNameIndex, VariantNameIndex,
+        FieldNameIndex, FieldNameListIndex, IndexIsEmpty, IsEmpty, MemberIndex, MemberListIndex,
+        SchemaNodeIndex, SchemaNodeListIndex, TraceIndex, TypeName, TypeNameIndex,
+        VariantNameIndex,
     },
     pool::{NonEmptyPool, Pool},
     schema::{Schema, SchemaNode},
@@ -435,6 +436,13 @@ fn same_name(left: &'static str, right: &'static str) -> bool {
     std::ptr::eq(left, right) || left == right
 }
 
+/// The error of a sequence or map whose element failed to trace, when the `Serialize`
+/// implementation ignored that and carried on: the failed element is already partly in the trace.
+#[cold]
+fn ignored_error() -> TraceError {
+    TraceError::Custom("an element failed to serialize, but serialization carried on".into())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SchemaBuilderNode {
     Bool,
@@ -681,8 +689,13 @@ impl SchemaBuilderNode {
                     .into_iter()
                     .map(|variant| variant.build(builder))
                     .collect::<Result<Vec<_>, _>>()?;
+                // Members only failed traces recorded (see the `Record` case) are bottom.
+                variants.retain(|variant| !variant.is_empty());
                 variants.sort_unstable();
                 variants.dedup();
+                if let [variant] = *variants {
+                    return Ok(variant);
+                }
                 if variants.len()
                     > usize::try_from(u32::MAX).expect("usize must be at least 32 bits")
                 {
@@ -691,12 +704,24 @@ impl SchemaBuilderNode {
                 SchemaNode::Union(builder.node_lists.intern_from(variants)?)
             }
             SchemaBuilderNode::Record {
+                keys: Some(_),
+                field_names: None,
+                ..
+            } => {
+                // A struct whose every value failed to trace: no trace refers to it.
+                SchemaNode::Union(SchemaNodeListIndex::EMPTY)
+            }
+            SchemaBuilderNode::Record {
                 name,
                 field_names,
                 field_types,
                 mut skippable,
                 ..
             } => {
+                let field_types = field_types
+                    .into_iter()
+                    .map(|field_type| field_type.build(builder))
+                    .collect::<Result<Vec<_>, _>>()?;
                 // Filter out fields whose type is an empty union (bottom-typed) from the skippable
                 // list. These are fields that are ALWAYS skipped, and therefore not considered
                 // skippABLE.
@@ -708,19 +733,10 @@ impl SchemaBuilderNode {
                 //    require discriminant bits.
                 // 3. Fields that are sometimes skipped (type != Union[], present in skip list).
                 //    Require discriminant bits.
-                skippable.retain(|&index| {
-                    !matches!(
-                        &field_types[usize::from(index)],
-                        SchemaBuilderNode::Union(variants) if variants.is_empty()
-                    )
-                });
+                skippable.retain(|&index| !field_types[usize::from(index)].is_empty());
                 if skippable.len() > MAX_SKIPPABLE_FIELDS {
                     return Err(TraceError::from(TraceLimitErrorKind::SkippableFields));
                 }
-                let field_types = field_types
-                    .into_iter()
-                    .map(|field_type| field_type.build(builder))
-                    .collect::<Result<Vec<_>, _>>()?;
                 let field_types = builder.node_lists.intern_from(field_types)?;
                 match (name, field_names) {
                     (None, None) => SchemaNode::Tuple(field_types),
@@ -954,6 +970,7 @@ impl<'a> Serializer for RootSerializer<'a> {
             item,
             reserved_length,
             length: 0,
+            failed: false,
         })
     }
 
@@ -1008,6 +1025,7 @@ impl<'a> Serializer for RootSerializer<'a> {
             value,
             reserved_length,
             length: 0,
+            failed: false,
         })
     }
 
@@ -1088,6 +1106,7 @@ impl<'a> RootSerializer<'a> {
             names: self.names,
             fields: field_types,
             length: 0,
+            failed: false,
         }
     }
 }
@@ -1098,6 +1117,8 @@ pub(crate) struct SequenceSchemaBuilder<'a> {
     item: &'a mut SchemaBuilderNode,
     reserved_length: TraceIndex,
     length: usize,
+    /// Whether an element failed to trace; see [`ignored_error`].
+    failed: bool,
 }
 
 impl SerializeSeq for SequenceSchemaBuilder<'_> {
@@ -1110,18 +1131,25 @@ impl SerializeSeq for SequenceSchemaBuilder<'_> {
         T: ?Sized + serde::Serialize,
     {
         self.length += 1;
-        T::serialize(
+        let result = T::serialize(
             value,
             RootSerializer {
                 data: self.data,
                 names: self.names,
                 slot: self.item,
             },
-        )
+        );
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 
     #[inline]
     fn end(self) -> Result<Self::Ok, Self::Error> {
+        if self.failed {
+            return Err(ignored_error());
+        }
         fill_reserved_bytes(
             self.data,
             self.reserved_length,
@@ -1140,6 +1168,8 @@ pub(crate) struct MapSchemaBuilder<'a> {
     value: &'a mut SchemaBuilderNode,
     reserved_length: TraceIndex,
     length: usize,
+    /// Whether a key or value failed to trace; see [`ignored_error`].
+    failed: bool,
 }
 
 impl SerializeMap for MapSchemaBuilder<'_> {
@@ -1152,14 +1182,18 @@ impl SerializeMap for MapSchemaBuilder<'_> {
         T: ?Sized + serde::Serialize,
     {
         self.length += 1;
-        T::serialize(
+        let result = T::serialize(
             key,
             RootSerializer {
                 data: self.data,
                 names: self.names,
                 slot: self.key,
             },
-        )
+        );
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 
     #[inline]
@@ -1167,18 +1201,25 @@ impl SerializeMap for MapSchemaBuilder<'_> {
     where
         T: ?Sized + serde::Serialize,
     {
-        T::serialize(
+        let result = T::serialize(
             value,
             RootSerializer {
                 data: self.data,
                 names: self.names,
                 slot: self.value,
             },
-        )
+        );
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 
     #[inline]
     fn end(self) -> Result<Self::Ok, Self::Error> {
+        if self.failed {
+            return Err(ignored_error());
+        }
         fill_reserved_bytes(
             self.data,
             self.reserved_length,
@@ -1196,6 +1237,9 @@ pub(crate) struct TupleSchemaBuilder<'a> {
     /// Exactly as many as the declared length.
     fields: &'a mut [SchemaBuilderNode],
     length: usize,
+    /// Whether an element failed to trace. An implementation may ignore that and carry on, even
+    /// retry the element, but the failed attempt is already in the trace.
+    failed: bool,
 }
 
 impl SerializeTuple for TupleSchemaBuilder<'_> {
@@ -1207,27 +1251,28 @@ impl SerializeTuple for TupleSchemaBuilder<'_> {
     where
         T: ?Sized + serde::Serialize,
     {
-        let slot = self
-            .fields
-            .get_mut(self.length)
-            .ok_or(TraceError::LengthMismatch)?;
-        T::serialize(
+        let Some(slot) = self.fields.get_mut(self.length) else {
+            self.failed = true;
+            return Err(TraceError::LengthMismatch);
+        };
+        let result = T::serialize(
             value,
             RootSerializer {
                 data: self.data,
                 names: self.names,
                 slot,
             },
-        )?;
-        // Only counted once traced, so an implementation that ignores the error and carries on
-        // fails in `end`.
+        );
+        if result.is_err() {
+            self.failed = true;
+        }
         self.length += 1;
-        Ok(())
+        result
     }
 
     #[inline]
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        if self.length != self.fields.len() {
+        if self.failed || self.length != self.fields.len() {
             return Err(TraceError::LengthMismatch);
         }
         Ok(())
@@ -1406,7 +1451,9 @@ impl<'a> StructSchemaBuilder<'a> {
         let found = find(slot, |node| {
             matches!(
                 node,
-                SchemaBuilderNode::Record { keys: Some(keys), .. } if keys.is_named(name, variant)
+                // A record without field names was only ever traced by values that failed.
+                SchemaBuilderNode::Record { keys: Some(keys), field_names: Some(_), .. }
+                    if keys.is_named(name, variant)
             )
         });
         let (location, type_name, growing) = match found {
@@ -1483,6 +1530,7 @@ impl SerializeStruct for StructSchemaBuilder<'_> {
         T: ?Sized + serde::Serialize,
     {
         if self.fields - self.skipped >= self.length {
+            self.failed = true;
             return Err(TraceError::LengthMismatch);
         }
         let slot = self
@@ -1497,7 +1545,9 @@ impl SerializeStruct for StructSchemaBuilder<'_> {
                 slot,
             },
         );
-        self.failed |= result.is_err();
+        if result.is_err() {
+            self.failed = true;
+        }
         result
     }
 

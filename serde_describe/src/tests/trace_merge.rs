@@ -233,3 +233,65 @@ fn failed_trace_leaves_a_usable_schema() {
         );
     }
 }
+
+/// A tuple struct with the same name as [`Thing`] and as many fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "Thing")]
+struct ThingTuple(u8, u32, Vec<String>);
+
+#[test]
+fn failed_struct_does_not_collide_with_tuple_struct() {
+    let mut builder = SchemaBuilder::new();
+    assert!(builder.trace(&[BadThing]).is_err());
+    let value = [ThingTuple(1, 2, vec!["x".into()])];
+    let trace = builder.trace(&value).unwrap();
+    let schema = builder.build().unwrap();
+    let bytes = bitcode::serialize(&(&schema, DescribedBy(&trace, &schema))).unwrap();
+    assert_eq!(
+        from_self_described_bitcode::<[ThingTuple; 1]>(&bytes).unwrap(),
+        value
+    );
+}
+
+/// Ignores the error of every failing element and carries on.
+struct Swallowing(Collection);
+
+enum Collection {
+    Seq,
+    Map,
+    Tuple,
+}
+
+impl Serialize for Swallowing {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeTuple};
+        match self.0 {
+            Collection::Seq => {
+                let mut seq = serializer.serialize_seq(None)?;
+                let _ = seq.serialize_element(&Failing);
+                seq.serialize_element(&2u8)?;
+                seq.end()
+            }
+            Collection::Map => {
+                let mut map = serializer.serialize_map(None)?;
+                map.serialize_key(&1u8)?;
+                let _ = map.serialize_value(&Failing);
+                map.end()
+            }
+            Collection::Tuple => {
+                // Retries the failed element.
+                let mut tuple = serializer.serialize_tuple(1)?;
+                let _ = tuple.serialize_element(&Failing);
+                tuple.serialize_element(&2u8)?;
+                tuple.end()
+            }
+        }
+    }
+}
+
+#[test]
+fn ignored_element_errors_fail_the_trace() {
+    for collection in [Collection::Seq, Collection::Map, Collection::Tuple] {
+        assert!(SchemaBuilder::new().trace(&Swallowing(collection)).is_err());
+    }
+}
