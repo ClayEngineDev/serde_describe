@@ -154,6 +154,8 @@ fn optional_targets_decode_through_the_schema_layer() {
 }
 
 std::thread_local! {
+    // Already `const`: clippy 1.98 flags it regardless.
+    #[allow(clippy::missing_const_for_thread_local)]
     static SEEN: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 

@@ -5,6 +5,23 @@
 
 # serde_describe
 
+> **ClayEngineDev fork.** Based on upstream 0.2.5. The wire format is unchanged: bytes written by
+> this fork and by upstream decode with either. Changes:
+>
+> - **Faster encode.** Tracing merges each value into its schema slot in place, and replay reads
+>   scalars, scalar sequences and sequences of plain structs straight off the trace (≈2.5–15×
+>   faster than 0.2.5).
+> - **Faster decode.** Exact-type numbers are forwarded straight to the inner deserializer.
+> - **Opt-in `positional-structs`.** Structs whose written fields match the target's are decoded
+>   positionally. Every visitor reached through `deserialize_struct` must then implement
+>   `visit_seq`.
+> - **Opt-in `raw-seq-elements`.** Long fixed-shape sequences are decoded raw after the first
+>   element.
+> - **Fixes.**
+>   - Scalar tag values are accepted as variant identifiers.
+>   - A trace fails if a `Serialize` implementation swallowed an element error.
+>   - Records that only failed traces produced are dropped from the schema.
+
 Make a non-self-describing [`serde`](https://docs.rs/serde) format (like
 [`bincode`](https://docs.rs/bincode2), [`bitcode`](https://docs.rs/bitcode) or
 [`postcard`](https://docs.rs/postcard)) behave like a self-describing one by

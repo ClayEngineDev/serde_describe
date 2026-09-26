@@ -765,9 +765,10 @@ fn discriminant_from_presence(skip_list: &[MemberIndex], presence: Presence<'_>)
 
 fn iter_field_indices(presence: &[u8]) -> impl DoubleEndedIterator<Item = MemberIndex> {
     presence
-        .chunks_exact(std::mem::size_of::<MemberIndex>())
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("impossible")))
-        .map(MemberIndex::from)
+        .as_chunks::<{ std::mem::size_of::<MemberIndex>() }>()
+        .0
+        .iter()
+        .map(|&chunk| MemberIndex::from(u32::from_le_bytes(chunk)))
 }
 
 // Any issues caused by a mismatch between the schema and the trace are technically bugs but

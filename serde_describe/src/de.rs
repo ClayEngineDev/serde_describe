@@ -35,6 +35,8 @@ mod probe {
     const DIRTY: u8 = 2;
 
     thread_local! {
+        // Already `const`: clippy 1.98 flags it regardless.
+        #[allow(clippy::missing_const_for_thread_local)]
         static STATE: Cell<u8> = const { Cell::new(OFF) };
     }
 

@@ -20,11 +20,10 @@ pub(crate) struct FastHasher(u64);
 impl Hasher for FastHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        let mut words = bytes.chunks_exact(8);
-        for word in &mut words {
-            self.write_u64(u64::from_le_bytes(word.try_into().expect("8 bytes")));
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &word in words {
+            self.write_u64(u64::from_le_bytes(word));
         }
-        let rest = words.remainder();
         if !rest.is_empty() {
             let mut word = [0; 8];
             word[..rest.len()].copy_from_slice(rest);
