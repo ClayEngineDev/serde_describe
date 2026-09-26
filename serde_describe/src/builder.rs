@@ -7,10 +7,10 @@ use crate::{
     },
     pool::{NonEmptyPool, Pool},
     schema::{Schema, SchemaNode},
-    trace::{Trace, TraceNodeKind},
+    trace::{ALL_FIELDS_PRESENT, Trace, TraceNodeKind},
 };
 use serde::{
-    Deserialize, Serialize,
+    Serialize,
     ser::{
         SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
         SerializeTupleStruct, SerializeTupleVariant, Serializer,
@@ -90,10 +90,7 @@ pub struct SchemaBuilder {
     nodes: Pool<SchemaNode, SchemaNodeIndex>,
     node_lists: Pool<Box<[SchemaNodeIndex]>, SchemaNodeListIndex>,
     member_lists: Pool<Box<[MemberIndex]>, MemberListIndex>,
-    field_name_lists: NonEmptyPool<Box<[FieldNameIndex]>, FieldNameListIndex>,
-    field_names: NonEmptyPool<&'static str, FieldNameIndex>,
-    variant_names: NonEmptyPool<&'static str, VariantNameIndex>,
-    type_names: NonEmptyPool<&'static str, TypeNameIndex>,
+    names: Names,
 }
 
 impl SchemaBuilder {
@@ -105,23 +102,23 @@ impl SchemaBuilder {
     /// Converts a type that supports [`serde::Serialize`] into a [`Trace`] and records its type
     /// into the schema.
     ///
+    /// If tracing fails, the types recorded so far may already include parts of the failed value.
+    /// The schema stays valid for every successfully traced value, it may just describe more
+    /// than they need.
+    ///
     /// See the top-level [`SchemaBuilder`] documentation for an example.
     pub fn trace<ValueT>(&mut self, value: &ValueT) -> Result<Trace, TraceError>
     where
         ValueT: Serialize,
     {
         let mut data = Vec::new();
-        let new_root = value.serialize(RootSerializer {
+        // Left over by a failed trace.
+        self.names.skipped.clear();
+        value.serialize(RootSerializer {
             data: &mut data,
-            nodes: &mut self.nodes,
-            node_lists: &mut self.node_lists,
-            member_lists: &mut self.member_lists,
-            field_name_lists: &mut self.field_name_lists,
-            field_names: &mut self.field_names,
-            variant_names: &mut self.variant_names,
-            type_names: &mut self.type_names,
+            names: &mut self.names,
+            slot: &mut self.root,
         })?;
-        self.root.union(new_root);
         Ok(Trace(data))
     }
 
@@ -135,16 +132,30 @@ impl SchemaBuilder {
             nodes: self.nodes.into(),
             node_lists: self.node_lists.into(),
             member_lists: self.member_lists.into(),
-            field_name_lists: self.field_name_lists.into(),
-            field_names: self.field_names.into(),
-            variant_names: self.variant_names.into(),
-            type_names: self.type_names.into(),
+            field_name_lists: self.names.field_name_lists.into(),
+            field_names: self.names.field_names.into(),
+            variant_names: self.names.variant_names.into(),
+            type_names: self.names.type_names.into(),
             seq_memo: Default::default(),
             fixed_shape_memo: Default::default(),
         };
         Ok(schema)
     }
 }
+
+/// The name pools filled while tracing.
+#[derive(Default, Clone)]
+pub(crate) struct Names {
+    field_name_lists: NonEmptyPool<Box<[FieldNameIndex]>, FieldNameListIndex>,
+    field_names: StaticNames<FieldNameIndex>,
+    variant_names: StaticNames<VariantNameIndex>,
+    type_names: StaticNames<TypeNameIndex>,
+    /// The fields skipped by the structs being traced, a stack of one run per struct.
+    skipped: Vec<MemberIndex>,
+}
+
+/// A pool of `&'static str` names.
+type StaticNames<IndexT> = NonEmptyPool<&'static str, IndexT>;
 
 /// Errors returned by tracing values.
 #[derive(Debug)]
@@ -260,36 +271,20 @@ impl std::fmt::Display for TraceLimitErrorKind {
 
 impl std::error::Error for TraceLimitErrorKind {}
 
+/// Traces one value: appends it to the trace and merges its type into `slot` in place, so values
+/// whose type is already recorded (e.g. every element of a sequence after the first) allocate
+/// nothing for the schema.
 pub(crate) struct RootSerializer<'a> {
     data: &'a mut Vec<u8>,
-    nodes: &'a mut Pool<SchemaNode, SchemaNodeIndex>,
-    node_lists: &'a mut Pool<Box<[SchemaNodeIndex]>, SchemaNodeListIndex>,
-    member_lists: &'a mut Pool<Box<[MemberIndex]>, MemberListIndex>,
-    field_name_lists: &'a mut NonEmptyPool<Box<[FieldNameIndex]>, FieldNameListIndex>,
-    field_names: &'a mut NonEmptyPool<&'static str, FieldNameIndex>,
-    variant_names: &'a mut NonEmptyPool<&'static str, VariantNameIndex>,
-    type_names: &'a mut NonEmptyPool<&'static str, TypeNameIndex>,
+    names: &'a mut Names,
+    slot: &'a mut SchemaBuilderNode,
 }
 
 impl RootSerializer<'_> {
     #[inline]
-    fn reborrow<'b>(&'b mut self) -> RootSerializer<'b> {
-        RootSerializer {
-            data: self.data,
-            nodes: self.nodes,
-            field_name_lists: self.field_name_lists,
-            node_lists: self.node_lists,
-            member_lists: self.member_lists,
-            field_names: self.field_names,
-            variant_names: self.variant_names,
-            type_names: self.type_names,
-        }
-    }
-
-    #[inline]
     fn push_struct_name(&mut self, name: &'static str) -> Result<TypeName, TraceLimitErrorKind> {
-        let name = self.type_names.intern(name)?;
-        self.push_u32(name.into());
+        let name = self.names.type_names.intern(name)?;
+        push_u32(self.data, name.into());
         Ok(TypeName(name, None))
     }
 
@@ -299,43 +294,18 @@ impl RootSerializer<'_> {
         name: &'static str,
         variant: &'static str,
     ) -> Result<TypeName, TraceLimitErrorKind> {
-        let name = self.type_names.intern(name)?;
-        let variant = self.variant_names.intern(variant)?;
-        self.push_u32(name.into());
-        self.push_u32(variant.into());
+        let name = self.names.type_names.intern(name)?;
+        let variant = self.names.variant_names.intern(variant)?;
+        push_u32(self.data, name.into());
+        push_u32(self.data, variant.into());
         Ok(TypeName(name, Some(variant)))
     }
 
     #[inline]
-    fn intern_field_name(
-        &mut self,
-        name: &'static str,
-    ) -> Result<FieldNameIndex, TraceLimitErrorKind> {
-        self.field_names.intern(name)
-    }
-
-    #[inline]
-    fn fill_reserved_field_name_list(
-        &mut self,
-        index: TraceIndex,
-        names: Vec<FieldNameIndex>,
-    ) -> Result<FieldNameListIndex, TraceLimitErrorKind> {
-        let names = self.field_name_lists.intern_from(names)?;
-        self.fill_reserved_bytes(index, &u32::from(names).to_le_bytes());
-        Ok(names)
-    }
-
-    #[inline]
-    fn push_u32(&mut self, integer: u32) {
-        self.data.extend(integer.to_le_bytes());
-    }
-
-    #[inline]
     fn push_u32_length(&mut self, length: usize) -> Result<(), TraceLimitErrorKind> {
-        self.data.extend(
-            u32::try_from(length)
-                .map_err(|_| TraceLimitErrorKind::Values)?
-                .to_le_bytes(),
+        push_u32(
+            self.data,
+            u32::try_from(length).map_err(|_| TraceLimitErrorKind::Values)?,
         );
         Ok(())
     }
@@ -347,45 +317,125 @@ impl RootSerializer<'_> {
 
     #[inline]
     fn reserve_u32(&mut self) -> Result<TraceIndex, TraceLimitErrorKind> {
-        self.reserve_bytes(std::mem::size_of::<u32>())
-    }
-
-    #[inline]
-    fn reserve_field_presence(&mut self, length: usize) -> Result<TraceIndex, TraceLimitErrorKind> {
-        self.reserve_bytes(std::mem::size_of::<u32>() * length)
-    }
-
-    #[inline]
-    fn reserve_bytes(&mut self, size: usize) -> Result<TraceIndex, TraceLimitErrorKind> {
         let index = TraceIndex::try_from(self.data.len())?;
-        self.data.extend(std::iter::repeat_n(!0, size));
+        self.data.extend_from_slice(&[!0; 4]);
         Ok(index)
     }
 
     #[inline]
     fn push_length_bytes(&mut self, bytes: &[u8]) -> Result<(), TraceLimitErrorKind> {
         self.push_u32_length(bytes.len())?;
-        self.data.extend(bytes);
+        self.data.extend_from_slice(bytes);
         Ok(())
-    }
-
-    #[inline]
-    fn fill_reserved_bytes(&mut self, index: TraceIndex, data: &[u8]) {
-        self.data[index.into()..][..data.len()].copy_from_slice(data);
-    }
-
-    #[inline]
-    fn write_field_presence(
-        &mut self,
-        index: TraceIndex,
-        field: MemberIndex,
-    ) -> Result<TraceIndex, TraceLimitErrorKind> {
-        self.fill_reserved_bytes(index, &u32::from(field).to_le_bytes());
-        TraceIndex::try_from(usize::from(index) + std::mem::size_of::<u32>())
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[inline]
+fn push_u32(data: &mut Vec<u8>, integer: u32) {
+    data.extend_from_slice(&integer.to_le_bytes());
+}
+
+#[inline]
+fn fill_reserved_bytes(data: &mut [u8], index: TraceIndex, bytes: &[u8]) {
+    data[index.into()..][..bytes.len()].copy_from_slice(bytes);
+}
+
+/// Merges a node without children (a scalar, unit or `None`) into `slot`. Callers check the
+/// common case, `slot` already being that node, inline.
+#[inline(never)]
+fn merge_leaf(slot: &mut SchemaBuilderNode, node: SchemaBuilderNode) {
+    match slot {
+        SchemaBuilderNode::Union(members) if !members.is_empty() => {
+            if !members.contains(&node) {
+                members.push(node);
+            }
+        }
+        _ if *slot == node => {}
+        _ => slot.union(node),
+    }
+}
+
+/// Where a node sits within a slot: the slot itself, or a member of the union in it.
+#[derive(Clone, Copy, Debug)]
+enum Location {
+    Itself,
+    Member(usize),
+}
+
+impl Location {
+    #[inline]
+    fn get(self, slot: &mut SchemaBuilderNode) -> &mut SchemaBuilderNode {
+        match (self, slot) {
+            (Location::Member(index), SchemaBuilderNode::Union(members)) => &mut members[index],
+            (_, slot) => slot,
+        }
+    }
+}
+
+/// Finds the member of `slot` (a non-union slot being its own only member) that `matches`
+/// accepts, adding `make()` as a new member if there is none, the same way
+/// [`SchemaBuilderNode::union`] would add a node that doesn't unify with any member.
+#[inline]
+fn locate(
+    slot: &mut SchemaBuilderNode,
+    matches: impl Fn(&SchemaBuilderNode) -> bool,
+    make: impl FnOnce() -> SchemaBuilderNode,
+) -> Location {
+    match find(slot, matches) {
+        Some(location) => location,
+        None => insert(slot, make()),
+    }
+}
+
+/// Finds the member of `slot` (a non-union slot being its own only member) that `matches`
+/// accepts.
+#[inline]
+fn find(
+    slot: &SchemaBuilderNode,
+    matches: impl Fn(&SchemaBuilderNode) -> bool,
+) -> Option<Location> {
+    match slot {
+        SchemaBuilderNode::Union(members) => members.iter().position(matches).map(Location::Member),
+        _ if matches(slot) => Some(Location::Itself),
+        _ => None,
+    }
+}
+
+/// Adds `node` to `slot` as a new member, which none of the existing members must unify with.
+#[inline]
+fn insert(slot: &mut SchemaBuilderNode, node: SchemaBuilderNode) -> Location {
+    match slot {
+        SchemaBuilderNode::Union(members) if members.is_empty() => {
+            *slot = node;
+            Location::Itself
+        }
+        SchemaBuilderNode::Union(members) => {
+            members.push(node);
+            Location::Member(members.len() - 1)
+        }
+        _ => {
+            let old = std::mem::take(slot);
+            *slot = SchemaBuilderNode::Union(vec![old, node]);
+            Location::Member(1)
+        }
+    }
+}
+
+#[inline]
+fn member(
+    slot: &mut SchemaBuilderNode,
+    matches: impl Fn(&SchemaBuilderNode) -> bool,
+    make: impl FnOnce() -> SchemaBuilderNode,
+) -> &mut SchemaBuilderNode {
+    locate(slot, matches, make).get(slot)
+}
+
+#[inline]
+fn same_name(left: &'static str, right: &'static str) -> bool {
+    std::ptr::eq(left, right) || left == right
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SchemaBuilderNode {
     Bool,
 
@@ -425,7 +475,30 @@ pub(crate) enum SchemaBuilderNode {
         field_names: Option<FieldNameListIndex>,
         field_types: Vec<SchemaBuilderNode>,
         skippable: Vec<MemberIndex>,
+        /// The names of a struct (`None` for tuples), kept alongside `name` and `field_names` so
+        /// tracing can match a value to a recorded struct without interning them.
+        keys: Option<StructKeys>,
     },
+}
+
+/// The `&'static str` names of a traced struct or struct variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StructKeys {
+    name: &'static str,
+    variant: Option<&'static str>,
+    fields: Vec<&'static str>,
+}
+
+impl StructKeys {
+    #[inline]
+    fn is_named(&self, name: &'static str, variant: Option<&'static str>) -> bool {
+        same_name(self.name, name)
+            && match (self.variant, variant) {
+                (None, None) => true,
+                (Some(left), Some(right)) => same_name(left, right),
+                _ => false,
+            }
+    }
 }
 
 impl SchemaBuilderNode {
@@ -464,12 +537,14 @@ impl SchemaBuilderNode {
                     field_names: left_field_names,
                     field_types: left_field_types,
                     skippable: left_skippable,
+                    ..
                 },
                 SchemaBuilderNode::Record {
                     name: right_name,
                     field_names: right_field_names,
                     field_types: right_field_types,
                     skippable: right_skippable,
+                    keys: right_keys,
                 },
             ) => {
                 if (*left_name, *left_field_names, left_field_types.len())
@@ -489,6 +564,7 @@ impl SchemaBuilderNode {
                         field_names: right_field_names,
                         field_types: right_field_types,
                         skippable: right_skippable,
+                        keys: right_keys,
                     })
                 }
             }
@@ -619,6 +695,7 @@ impl SchemaBuilderNode {
                 field_names,
                 field_types,
                 mut skippable,
+                ..
             } => {
                 // Filter out fields whose type is an empty union (bottom-typed) from the skippable
                 // list. These are fields that are ALWAYS skipped, and therefore not considered
@@ -684,7 +761,10 @@ macro_rules! fn_serialize_as_u8 {
             fn $fn_name(mut self, value: $value_type) -> Result<Self::Ok, Self::Error> {
                 self.push_trace(TraceNodeKind::$node);
                 self.data.push(value as u8);
-                Ok(SchemaBuilderNode::$node)
+                if !matches!(self.slot, SchemaBuilderNode::$node) {
+                    merge_leaf(self.slot, SchemaBuilderNode::$node);
+                }
+                Ok(())
             }
         )+
     };
@@ -695,17 +775,19 @@ macro_rules! fn_serialize_as_le_bytes {
         $(
             #[inline]
             fn $fn_name(mut self, value: $value_type) -> Result<Self::Ok, Self::Error> {
-
                 self.push_trace(TraceNodeKind::$node);
                 self.data.extend_from_slice(&value.to_le_bytes());
-                Ok(SchemaBuilderNode::$node)
+                if !matches!(self.slot, SchemaBuilderNode::$node) {
+                    merge_leaf(self.slot, SchemaBuilderNode::$node);
+                }
+                Ok(())
             }
         )+
     };
 }
 
 impl<'a> Serializer for RootSerializer<'a> {
-    type Ok = SchemaBuilderNode;
+    type Ok = ();
     type Error = TraceError;
 
     type SerializeSeq = SequenceSchemaBuilder<'a>;
@@ -738,28 +820,40 @@ impl<'a> Serializer for RootSerializer<'a> {
     #[inline]
     fn serialize_char(mut self, value: char) -> Result<Self::Ok, Self::Error> {
         self.push_trace(TraceNodeKind::Char);
-        self.push_u32(u32::from(value));
-        Ok(SchemaBuilderNode::Char)
+        push_u32(self.data, u32::from(value));
+        if !matches!(self.slot, SchemaBuilderNode::Char) {
+            merge_leaf(self.slot, SchemaBuilderNode::Char);
+        }
+        Ok(())
     }
 
     #[inline]
     fn serialize_str(mut self, value: &str) -> Result<Self::Ok, Self::Error> {
         self.push_trace(TraceNodeKind::String);
         self.push_length_bytes(value.as_bytes())?;
-        Ok(SchemaBuilderNode::String)
+        if !matches!(self.slot, SchemaBuilderNode::String) {
+            merge_leaf(self.slot, SchemaBuilderNode::String);
+        }
+        Ok(())
     }
 
     #[inline]
     fn serialize_bytes(mut self, value: &[u8]) -> Result<Self::Ok, Self::Error> {
         self.push_trace(TraceNodeKind::Bytes);
         self.push_length_bytes(value)?;
-        Ok(SchemaBuilderNode::Bytes)
+        if !matches!(self.slot, SchemaBuilderNode::Bytes) {
+            merge_leaf(self.slot, SchemaBuilderNode::Bytes);
+        }
+        Ok(())
     }
 
     #[inline]
     fn serialize_none(mut self) -> Result<Self::Ok, Self::Error> {
         self.push_trace(TraceNodeKind::OptionNone);
-        Ok(SchemaBuilderNode::OptionNone)
+        if !matches!(self.slot, SchemaBuilderNode::OptionNone) {
+            merge_leaf(self.slot, SchemaBuilderNode::OptionNone);
+        }
+        Ok(())
     }
 
     #[inline]
@@ -768,19 +862,36 @@ impl<'a> Serializer for RootSerializer<'a> {
         T: ?Sized + Serialize,
     {
         self.push_trace(TraceNodeKind::OptionSome);
-        T::serialize(value, self).map(|inner| SchemaBuilderNode::OptionSome(Box::new(inner)))
+        let SchemaBuilderNode::OptionSome(inner) = member(
+            self.slot,
+            |node| matches!(node, SchemaBuilderNode::OptionSome(_)),
+            || SchemaBuilderNode::OptionSome(Box::default()),
+        ) else {
+            unreachable!("located node is not an option")
+        };
+        T::serialize(
+            value,
+            RootSerializer {
+                data: self.data,
+                names: self.names,
+                slot: inner,
+            },
+        )
     }
 
     #[inline]
     fn serialize_unit(mut self) -> Result<Self::Ok, Self::Error> {
         self.push_trace(TraceNodeKind::Unit);
-        Ok(SchemaBuilderNode::Unit(None))
+        merge_leaf(self.slot, SchemaBuilderNode::Unit(None));
+        Ok(())
     }
 
     #[inline]
     fn serialize_unit_struct(mut self, name: &'static str) -> Result<Self::Ok, Self::Error> {
         self.push_trace(TraceNodeKind::UnitStruct);
-        Ok(SchemaBuilderNode::Unit(Some(self.push_struct_name(name)?)))
+        let name = self.push_struct_name(name)?;
+        merge_leaf(self.slot, SchemaBuilderNode::Unit(Some(name)));
+        Ok(())
     }
 
     #[inline]
@@ -791,9 +902,9 @@ impl<'a> Serializer for RootSerializer<'a> {
         variant: &'static str,
     ) -> Result<Self::Ok, Self::Error> {
         self.push_trace(TraceNodeKind::UnitVariant);
-        Ok(SchemaBuilderNode::Unit(Some(
-            self.push_variant_name(name, variant)?,
-        )))
+        let name = self.push_variant_name(name, variant)?;
+        merge_leaf(self.slot, SchemaBuilderNode::Unit(Some(name)));
+        Ok(())
     }
 
     #[inline]
@@ -806,10 +917,8 @@ impl<'a> Serializer for RootSerializer<'a> {
         T: ?Sized + Serialize,
     {
         self.push_trace(TraceNodeKind::NewtypeStruct);
-        Ok(SchemaBuilderNode::Newtype(
-            self.push_struct_name(name)?,
-            Box::new(T::serialize(value, self)?),
-        ))
+        let name = self.push_struct_name(name)?;
+        self.newtype(name, value)
     }
 
     #[inline]
@@ -824,20 +933,27 @@ impl<'a> Serializer for RootSerializer<'a> {
         T: ?Sized + Serialize,
     {
         self.push_trace(TraceNodeKind::NewtypeVariant);
-        Ok(SchemaBuilderNode::Newtype(
-            self.push_variant_name(name, variant)?,
-            Box::new(T::serialize(value, self)?),
-        ))
+        let name = self.push_variant_name(name, variant)?;
+        self.newtype(name, value)
     }
 
     #[inline]
     fn serialize_seq(mut self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
         self.push_trace(TraceNodeKind::Sequence);
+        let reserved_length = self.reserve_u32()?;
+        let SchemaBuilderNode::Sequence(item) = member(
+            self.slot,
+            |node| matches!(node, SchemaBuilderNode::Sequence(_)),
+            || SchemaBuilderNode::Sequence(Box::default()),
+        ) else {
+            unreachable!("located node is not a sequence")
+        };
         Ok(SequenceSchemaBuilder {
-            reserved_length: self.reserve_u32()?,
-            item: SchemaBuilderNode::default(),
+            data: self.data,
+            names: self.names,
+            item,
+            reserved_length,
             length: 0,
-            parent: self,
         })
     }
 
@@ -845,12 +961,7 @@ impl<'a> Serializer for RootSerializer<'a> {
     fn serialize_tuple(mut self, len: usize) -> Result<Self::SerializeTuple, Self::Error> {
         self.push_trace(TraceNodeKind::Tuple);
         self.push_u32_length(len)?;
-        Ok(TupleSchemaBuilder {
-            name: None,
-            schemas: Vec::with_capacity(len),
-            length: len,
-            parent: self,
-        })
+        Ok(self.tuple(None, len))
     }
 
     #[inline]
@@ -861,12 +972,8 @@ impl<'a> Serializer for RootSerializer<'a> {
     ) -> Result<Self::SerializeTupleStruct, Self::Error> {
         self.push_trace(TraceNodeKind::TupleStruct);
         self.push_u32_length(len)?;
-        Ok(TupleSchemaBuilder {
-            name: Some(self.push_struct_name(name)?),
-            schemas: Vec::with_capacity(len),
-            length: len,
-            parent: self,
-        })
+        let name = self.push_struct_name(name)?;
+        Ok(self.tuple(Some(name), len))
     }
 
     #[inline]
@@ -879,23 +986,28 @@ impl<'a> Serializer for RootSerializer<'a> {
     ) -> Result<Self::SerializeTupleVariant, Self::Error> {
         self.push_trace(TraceNodeKind::TupleVariant);
         self.push_u32_length(len)?;
-        Ok(TupleSchemaBuilder {
-            name: Some(self.push_variant_name(name, variant)?),
-            schemas: Vec::with_capacity(len),
-            length: len,
-            parent: self,
-        })
+        let name = self.push_variant_name(name, variant)?;
+        Ok(self.tuple(Some(name), len))
     }
 
     #[inline]
     fn serialize_map(mut self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
         self.push_trace(TraceNodeKind::Map);
+        let reserved_length = self.reserve_u32()?;
+        let SchemaBuilderNode::Map(key, value) = member(
+            self.slot,
+            |node| matches!(node, SchemaBuilderNode::Map(_, _)),
+            || SchemaBuilderNode::Map(Box::default(), Box::default()),
+        ) else {
+            unreachable!("located node is not a map")
+        };
         Ok(MapSchemaBuilder {
-            reserved_length: self.reserve_u32()?,
-            key_schema: SchemaBuilderNode::default(),
-            value_schema: SchemaBuilderNode::default(),
+            data: self.data,
+            names: self.names,
+            key,
+            value,
+            reserved_length,
             length: 0,
-            parent: self,
         })
     }
 
@@ -906,7 +1018,7 @@ impl<'a> Serializer for RootSerializer<'a> {
         len: usize,
     ) -> Result<Self::SerializeStruct, Self::Error> {
         self.push_trace(TraceNodeKind::Struct);
-        StructSchemaBuilder::new(self.push_struct_name(name)?, len, self)
+        StructSchemaBuilder::new(name, None, len, self)
     }
 
     #[inline]
@@ -918,7 +1030,7 @@ impl<'a> Serializer for RootSerializer<'a> {
         len: usize,
     ) -> Result<Self::SerializeStructVariant, Self::Error> {
         self.push_trace(TraceNodeKind::StructVariant);
-        StructSchemaBuilder::new(self.push_variant_name(name, variant)?, len, self)
+        StructSchemaBuilder::new(name, Some(variant), len, self)
     }
 
     #[inline]
@@ -927,15 +1039,69 @@ impl<'a> Serializer for RootSerializer<'a> {
     }
 }
 
+impl<'a> RootSerializer<'a> {
+    #[inline]
+    fn newtype<T>(self, name: TypeName, value: &T) -> Result<(), TraceError>
+    where
+        T: ?Sized + Serialize,
+    {
+        let SchemaBuilderNode::Newtype(_, inner) = member(
+            self.slot,
+            |node| matches!(node, SchemaBuilderNode::Newtype(other, _) if *other == name),
+            || SchemaBuilderNode::Newtype(name, Box::default()),
+        ) else {
+            unreachable!("located node is not a newtype")
+        };
+        T::serialize(
+            value,
+            RootSerializer {
+                data: self.data,
+                names: self.names,
+                slot: inner,
+            },
+        )
+    }
+
+    #[inline]
+    fn tuple(self, name: Option<TypeName>, len: usize) -> TupleSchemaBuilder<'a> {
+        let SchemaBuilderNode::Record { field_types, .. } = member(
+            self.slot,
+            |node| {
+                matches!(
+                    node,
+                    SchemaBuilderNode::Record { name: other, keys: None, field_types, .. }
+                        if *other == name && field_types.len() == len
+                )
+            },
+            || SchemaBuilderNode::Record {
+                name,
+                field_names: None,
+                field_types: vec![SchemaBuilderNode::default(); len],
+                skippable: Vec::new(),
+                keys: None,
+            },
+        ) else {
+            unreachable!("located node is not a record")
+        };
+        TupleSchemaBuilder {
+            data: self.data,
+            names: self.names,
+            fields: field_types,
+            length: 0,
+        }
+    }
+}
+
 pub(crate) struct SequenceSchemaBuilder<'a> {
-    parent: RootSerializer<'a>,
+    data: &'a mut Vec<u8>,
+    names: &'a mut Names,
+    item: &'a mut SchemaBuilderNode,
     reserved_length: TraceIndex,
-    item: SchemaBuilderNode,
     length: usize,
 }
 
-impl<'a> SerializeSeq for SequenceSchemaBuilder<'a> {
-    type Ok = SchemaBuilderNode;
+impl SerializeSeq for SequenceSchemaBuilder<'_> {
+    type Ok = ();
     type Error = TraceError;
 
     #[inline]
@@ -944,33 +1110,40 @@ impl<'a> SerializeSeq for SequenceSchemaBuilder<'a> {
         T: ?Sized + serde::Serialize,
     {
         self.length += 1;
-        self.item
-            .union(T::serialize(value, self.parent.reborrow())?);
-        Ok(())
+        T::serialize(
+            value,
+            RootSerializer {
+                data: self.data,
+                names: self.names,
+                slot: self.item,
+            },
+        )
     }
 
     #[inline]
-    fn end(mut self) -> Result<Self::Ok, Self::Error> {
-        self.parent.fill_reserved_bytes(
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        fill_reserved_bytes(
+            self.data,
             self.reserved_length,
             &u32::try_from(self.length)
                 .map_err(|_| TraceLimitErrorKind::Values)?
                 .to_le_bytes(),
         );
-        Ok(SchemaBuilderNode::Sequence(Box::new(self.item)))
+        Ok(())
     }
 }
 
 pub(crate) struct MapSchemaBuilder<'a> {
-    parent: RootSerializer<'a>,
+    data: &'a mut Vec<u8>,
+    names: &'a mut Names,
+    key: &'a mut SchemaBuilderNode,
+    value: &'a mut SchemaBuilderNode,
     reserved_length: TraceIndex,
-    key_schema: SchemaBuilderNode,
-    value_schema: SchemaBuilderNode,
     length: usize,
 }
 
 impl SerializeMap for MapSchemaBuilder<'_> {
-    type Ok = SchemaBuilderNode;
+    type Ok = ();
     type Error = TraceError;
 
     #[inline]
@@ -979,9 +1152,14 @@ impl SerializeMap for MapSchemaBuilder<'_> {
         T: ?Sized + serde::Serialize,
     {
         self.length += 1;
-        self.key_schema
-            .union(T::serialize(key, self.parent.reborrow())?);
-        Ok(())
+        T::serialize(
+            key,
+            RootSerializer {
+                data: self.data,
+                names: self.names,
+                slot: self.key,
+            },
+        )
     }
 
     #[inline]
@@ -989,35 +1167,39 @@ impl SerializeMap for MapSchemaBuilder<'_> {
     where
         T: ?Sized + serde::Serialize,
     {
-        self.value_schema
-            .union(T::serialize(value, self.parent.reborrow())?);
-        Ok(())
+        T::serialize(
+            value,
+            RootSerializer {
+                data: self.data,
+                names: self.names,
+                slot: self.value,
+            },
+        )
     }
 
     #[inline]
-    fn end(mut self) -> Result<Self::Ok, Self::Error> {
-        self.parent.fill_reserved_bytes(
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        fill_reserved_bytes(
+            self.data,
             self.reserved_length,
             &u32::try_from(self.length)
                 .map_err(|_| TraceLimitErrorKind::Values)?
                 .to_le_bytes(),
         );
-        Ok(SchemaBuilderNode::Map(
-            Box::new(self.key_schema),
-            Box::new(self.value_schema),
-        ))
+        Ok(())
     }
 }
 
 pub(crate) struct TupleSchemaBuilder<'a> {
-    parent: RootSerializer<'a>,
-    name: Option<TypeName>,
-    schemas: Vec<SchemaBuilderNode>,
+    data: &'a mut Vec<u8>,
+    names: &'a mut Names,
+    /// Exactly as many as the declared length.
+    fields: &'a mut [SchemaBuilderNode],
     length: usize,
 }
 
 impl SerializeTuple for TupleSchemaBuilder<'_> {
-    type Ok = SchemaBuilderNode;
+    type Ok = ();
     type Error = TraceError;
 
     #[inline]
@@ -1025,27 +1207,35 @@ impl SerializeTuple for TupleSchemaBuilder<'_> {
     where
         T: ?Sized + serde::Serialize,
     {
-        self.schemas
-            .push(T::serialize(value, self.parent.reborrow())?);
+        let slot = self
+            .fields
+            .get_mut(self.length)
+            .ok_or(TraceError::LengthMismatch)?;
+        T::serialize(
+            value,
+            RootSerializer {
+                data: self.data,
+                names: self.names,
+                slot,
+            },
+        )?;
+        // Only counted once traced, so an implementation that ignores the error and carries on
+        // fails in `end`.
+        self.length += 1;
         Ok(())
     }
 
     #[inline]
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        if self.schemas.len() != self.length {
+        if self.length != self.fields.len() {
             return Err(TraceError::LengthMismatch);
         }
-        Ok(SchemaBuilderNode::Record {
-            name: self.name,
-            field_names: None,
-            field_types: self.schemas,
-            skippable: Vec::new(),
-        })
+        Ok(())
     }
 }
 
 impl SerializeTupleStruct for TupleSchemaBuilder<'_> {
-    type Ok = SchemaBuilderNode;
+    type Ok = ();
     type Error = TraceError;
 
     #[inline]
@@ -1063,7 +1253,7 @@ impl SerializeTupleStruct for TupleSchemaBuilder<'_> {
 }
 
 impl SerializeTupleVariant for TupleSchemaBuilder<'_> {
-    type Ok = SchemaBuilderNode;
+    type Ok = ();
     type Error = TraceError;
 
     #[inline]
@@ -1080,45 +1270,211 @@ impl SerializeTupleVariant for TupleSchemaBuilder<'_> {
     }
 }
 
+/// Which record a [`StructSchemaBuilder`] merges fields into.
+enum StructTarget {
+    /// A record in the slot, recorded by earlier values (or created for this one).
+    InSlot(Location),
+    /// This value's fields turned out to differ from the record in the slot that has the same
+    /// name, so they go into a separate record that is added to the slot at the end.
+    Detached(SchemaBuilderNode),
+}
+
+struct RecordParts<'r> {
+    name: &'r mut Option<TypeName>,
+    field_names: &'r mut Option<FieldNameListIndex>,
+    field_types: &'r mut Vec<SchemaBuilderNode>,
+    skippable: &'r mut Vec<MemberIndex>,
+    keys: &'r mut StructKeys,
+}
+
+impl StructTarget {
+    #[inline]
+    fn parts<'r>(&'r mut self, slot: &'r mut SchemaBuilderNode) -> RecordParts<'r> {
+        let node = match self {
+            StructTarget::InSlot(location) => location.get(slot),
+            StructTarget::Detached(node) => node,
+        };
+        let SchemaBuilderNode::Record {
+            name,
+            field_names,
+            field_types,
+            skippable,
+            keys: Some(keys),
+        } = node
+        else {
+            unreachable!("struct target is not a struct record")
+        };
+        RecordParts {
+            name,
+            field_names,
+            field_types,
+            skippable,
+            keys,
+        }
+    }
+
+    /// Makes the target record's field `index` (the next one) `key` and returns its type,
+    /// switching to a detached record if the recorded one has a different field there.
+    #[inline]
+    fn enter_field<'r>(
+        &'r mut self,
+        slot: &'r mut SchemaBuilderNode,
+        growing: &mut bool,
+        index: usize,
+        key: &'static str,
+    ) -> &'r mut SchemaBuilderNode {
+        if !*growing
+            && !self
+                .parts(slot)
+                .keys
+                .fields
+                .get(index)
+                .is_some_and(|&known| same_name(known, key))
+        {
+            self.detach(slot, index);
+            *growing = true;
+        }
+        let parts = self.parts(slot);
+        if *growing {
+            parts.keys.fields.push(key);
+            parts.field_types.push(SchemaBuilderNode::default());
+        }
+        &mut parts.field_types[index]
+    }
+
+    /// Continues in a separate record seeded with the first `fields` fields of the current one.
+    /// Those already include this value's types, merged in place, so the seed describes them;
+    /// it may describe more (types other values had there), which is harmless.
+    #[cold]
+    fn detach(&mut self, slot: &mut SchemaBuilderNode, fields: usize) {
+        let parts = self.parts(slot);
+        let node = SchemaBuilderNode::Record {
+            name: *parts.name,
+            field_names: None,
+            field_types: parts.field_types[..fields].to_vec(),
+            skippable: parts
+                .skippable
+                .iter()
+                .copied()
+                .filter(|&field| usize::from(field) < fields)
+                .collect(),
+            keys: Some(StructKeys {
+                name: parts.keys.name,
+                variant: parts.keys.variant,
+                fields: parts.keys.fields[..fields].to_vec(),
+            }),
+        };
+        *self = StructTarget::Detached(node);
+    }
+}
+
+/// Size of a struct's trace header after its names: the field name list, the number of
+/// serialized fields and the presence list offset (see [`ALL_FIELDS_PRESENT`]).
+const STRUCT_HEADER_SIZE: usize = 3 * std::mem::size_of::<u32>();
+
 pub(crate) struct StructSchemaBuilder<'a> {
-    parent: RootSerializer<'a>,
-    name: TypeName,
-    reserved_field_name_list: TraceIndex,
-    reserved_field_presence: TraceIndex,
-    field_names: Vec<FieldNameIndex>,
-    field_types: Vec<SchemaBuilderNode>,
-    skipped: Vec<MemberIndex>,
+    data: &'a mut Vec<u8>,
+    names: &'a mut Names,
+    slot: &'a mut SchemaBuilderNode,
+    target: StructTarget,
+    /// Whether the target record is new for this value, so its fields get appended rather than
+    /// matched against the recorded ones.
+    growing: bool,
+    /// Where the struct header starts in the trace.
+    header: usize,
+    /// Where this struct's skipped fields start in [`Names::skipped`].
+    skipped_start: usize,
+    /// Fields seen so far, serialized or skipped.
+    fields: usize,
+    skipped: usize,
+    /// Declared number of serialized (non-skipped) fields.
     length: usize,
+    /// Whether a field failed to serialize; an implementation may ignore that and carry on,
+    /// which must still fail tracing.
+    failed: bool,
 }
 
 impl<'a> StructSchemaBuilder<'a> {
     pub fn new(
-        name: TypeName,
+        name: &'static str,
+        variant: Option<&'static str>,
         length: usize,
-        mut parent: RootSerializer<'a>,
+        parent: RootSerializer<'a>,
     ) -> Result<Self, TraceError> {
-        let reserved_field_name_list = parent.reserve_u32()?;
+        let RootSerializer { data, names, slot } = parent;
+        // Nearly always the slot already has this struct, and with it the interned names.
+        let found = find(slot, |node| {
+            matches!(
+                node,
+                SchemaBuilderNode::Record { keys: Some(keys), .. } if keys.is_named(name, variant)
+            )
+        });
+        let (location, type_name, growing) = match found {
+            Some(location) => {
+                let SchemaBuilderNode::Record {
+                    name: Some(type_name),
+                    ..
+                } = location.get(slot)
+                else {
+                    unreachable!("located node is not a named record")
+                };
+                (location, *type_name, false)
+            }
+            None => {
+                let type_name = TypeName(
+                    names.type_names.intern(name)?,
+                    variant
+                        .map(|variant| names.variant_names.intern(variant))
+                        .transpose()?,
+                );
+                let record = SchemaBuilderNode::Record {
+                    name: Some(type_name),
+                    field_names: None,
+                    field_types: Vec::with_capacity(length),
+                    skippable: Vec::new(),
+                    keys: Some(StructKeys {
+                        name,
+                        variant,
+                        fields: Vec::with_capacity(length),
+                    }),
+                };
+                (insert(slot, record), type_name, true)
+            }
+        };
+
+        push_u32(data, type_name.0.into());
+        if let Some(variant) = type_name.1 {
+            push_u32(data, variant.into());
+        }
+        let header = usize::from(TraceIndex::try_from(data.len())?);
         // Note that, maybe counter-intuitively, this `length` does NOT include skipped fields.
         // This explicitly documented by `serde`.
-        //
-        // So we're reserving precisely as much data as we're going to serialize. This is important
-        // for the whole "skippable" field logic to work.
-        parent.push_u32_length(length)?;
+        let mut bytes = [!0; STRUCT_HEADER_SIZE];
+        bytes[4..8].copy_from_slice(
+            &u32::try_from(length)
+                .map_err(|_| TraceLimitErrorKind::Values)?
+                .to_le_bytes(),
+        );
+        data.extend_from_slice(&bytes);
+
         Ok(Self {
-            name,
-            reserved_field_name_list,
-            reserved_field_presence: parent.reserve_field_presence(length)?,
-            field_names: Vec::with_capacity(length),
-            field_types: Vec::with_capacity(length),
-            skipped: Vec::new(),
+            data,
+            skipped_start: names.skipped.len(),
+            names,
+            slot,
+            target: StructTarget::InSlot(location),
+            growing,
+            header,
+            fields: 0,
+            skipped: 0,
             length,
-            parent,
+            failed: false,
         })
     }
 }
 
 impl SerializeStruct for StructSchemaBuilder<'_> {
-    type Ok = SchemaBuilderNode;
+    type Ok = ();
     type Error = TraceError;
 
     #[inline]
@@ -1126,54 +1482,103 @@ impl SerializeStruct for StructSchemaBuilder<'_> {
     where
         T: ?Sized + serde::Serialize,
     {
-        if self.field_names.len() - self.skipped.len() >= self.length {
+        if self.fields - self.skipped >= self.length {
             return Err(TraceError::LengthMismatch);
         }
-        self.reserved_field_presence = self.parent.write_field_presence(
-            self.reserved_field_presence,
-            MemberIndex::try_from(self.field_names.len())?,
-        )?;
-        self.field_names.push(self.parent.intern_field_name(key)?);
-        self.field_types
-            .push(T::serialize(value, self.parent.reborrow())?);
-        Ok(())
+        let slot = self
+            .target
+            .enter_field(self.slot, &mut self.growing, self.fields, key);
+        self.fields += 1;
+        let result = T::serialize(
+            value,
+            RootSerializer {
+                data: self.data,
+                names: self.names,
+                slot,
+            },
+        );
+        self.failed |= result.is_err();
+        result
     }
 
     #[inline]
     fn skip_field(&mut self, key: &'static str) -> Result<(), Self::Error> {
-        let skipped = self.field_names.len().try_into()?;
-        self.field_names.push(self.parent.intern_field_name(key)?);
-        self.field_types.push(SchemaBuilderNode::default());
-        // Push to `skipped` last, so that early returns cannot break
-        // `skipped.len() <= field_names.len()`.
-        self.skipped.push(skipped);
+        let skipped = MemberIndex::try_from(self.fields)?;
+        self.target
+            .enter_field(self.slot, &mut self.growing, self.fields, key);
+        self.fields += 1;
+        self.skipped += 1;
+        self.names.skipped.push(skipped);
+        let skippable = self.target.parts(self.slot).skippable;
+        if let Err(position) = skippable.binary_search(&skipped) {
+            skippable.insert(position, skipped);
+        }
         Ok(())
     }
 
     #[inline]
     fn end(mut self) -> Result<Self::Ok, Self::Error> {
-        // The second condition can only trigger if a `Serialize` implementation ignored an error
-        // returned by `serialize_field` and carried on, leaving names and types out of sync.
-        if self.field_names.len() - self.skipped.len() != self.length
-            || self.field_names.len() != self.field_types.len()
+        if self.failed
+            || self.fields - self.skipped != self.length
+            || self.names.skipped.len() - self.skipped_start != self.skipped
         {
             return Err(TraceError::LengthMismatch);
         }
-        let field_names = Some(
-            self.parent
-                .fill_reserved_field_name_list(self.reserved_field_name_list, self.field_names)?,
-        );
-        Ok(SchemaBuilderNode::Record {
-            name: Some(self.name),
-            field_names,
-            field_types: self.field_types,
-            skippable: self.skipped,
-        })
+        if !self.growing && self.target.parts(self.slot).keys.fields.len() != self.fields {
+            // The recorded struct has more fields than this value.
+            self.target.detach(self.slot, self.fields);
+        }
+
+        let parts = self.target.parts(self.slot);
+        let field_names = match *parts.field_names {
+            Some(field_names) => field_names,
+            None => {
+                let names = parts
+                    .keys
+                    .fields
+                    .iter()
+                    .map(|&key| self.names.field_names.intern(key))
+                    .collect::<Result<Box<[_]>, _>>()?;
+                let field_names = self.names.field_name_lists.intern(names)?;
+                *parts.field_names = Some(field_names);
+                field_names
+            }
+        };
+        self.data[self.header..][..4].copy_from_slice(&u32::from(field_names).to_le_bytes());
+
+        if self.skipped > 0 {
+            // The presence list: the indices of the serialized fields, after their values.
+            let offset = self.data.len() - (self.header + STRUCT_HEADER_SIZE);
+            let offset = u32::try_from(offset)
+                .ok()
+                .filter(|&offset| offset != ALL_FIELDS_PRESENT)
+                .ok_or(TraceLimitErrorKind::Values)?;
+            self.data[self.header + 8..][..4].copy_from_slice(&offset.to_le_bytes());
+            self.data.reserve(self.length * std::mem::size_of::<u32>());
+            let mut skipped = self.names.skipped[self.skipped_start..].iter().peekable();
+            for field in 0..self.fields {
+                if skipped
+                    .next_if(|&&skipped| usize::from(skipped) == field)
+                    .is_none()
+                {
+                    push_u32(
+                        self.data,
+                        u32::try_from(field).expect("field index fits u32"),
+                    );
+                }
+            }
+            self.names.skipped.truncate(self.skipped_start);
+        }
+
+        if let StructTarget::Detached(node) = self.target {
+            self.slot.union(node);
+        }
+        Ok(())
     }
 }
 
 impl SerializeStructVariant for StructSchemaBuilder<'_> {
-    type Ok = SchemaBuilderNode;
+    type Ok = ();
     type Error = TraceError;
 
     #[inline]

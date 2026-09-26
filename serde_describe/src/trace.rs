@@ -57,6 +57,12 @@ pub(crate) enum TraceNode {
 #[must_use = "a trace is only useful if it's later serialized with the resulting schema"]
 pub struct Trace(pub(crate) Vec<u8>);
 
+/// A struct's trace is its names, then a header of three `u32`-s: the field name list, the
+/// number of serialized fields and the offset of the presence list from the end of the header,
+/// then the values of the serialized fields. The presence list, the indices of the serialized
+/// fields, follows the values only if some field was skipped; otherwise the offset is this.
+pub(crate) const ALL_FIELDS_PRESENT: u32 = u32::MAX;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 #[repr(u8)]
 pub enum TraceNodeKind {

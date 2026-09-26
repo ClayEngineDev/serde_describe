@@ -4,10 +4,11 @@ use crate::{
     builder::SchemaBuilder,
     described::SelfDescribed,
     indices::{
-        FieldNameListIndex, MemberIndex, MemberListIndex, SchemaNodeIndex, SchemaNodeListIndex,
+        FieldNameListIndex, IsEmpty, MemberIndex, MemberListIndex, SchemaNodeIndex,
+        SchemaNodeListIndex,
     },
     schema::SchemaNode,
-    trace::{ReadTraceExt, TraceNode},
+    trace::{ALL_FIELDS_PRESENT, ReadTraceExt, TraceNode, TraceNodeKind},
 };
 use serde::{
     Serialize,
@@ -111,6 +112,52 @@ impl<'a> TraceCursor<'a> {
         })
     }
 
+    /// Like [`Self::pop_child`], but reads a scalar straight off the trace, skipping the
+    /// general trace-schema check.
+    #[inline]
+    fn pop_element<ErrorT>(&self, node: SchemaNodeIndex) -> Result<Element<'a>, ErrorT>
+    where
+        ErrorT: serde::ser::Error,
+    {
+        let node = self.schema.node(node).map_err(ErrorT::custom)?;
+        macro_rules! scalars {
+            ($($node:ident => $pop:ident,)+) => {
+                match node {
+                    $(
+                        SchemaNode::$node => {
+                            self.expect_trace_kind::<ErrorT>(TraceNodeKind::$node)?;
+                            return Ok(Element::Scalar(Scalar::$node(self.tail.$pop()?)));
+                        }
+                    )+
+                    _ => {}
+                }
+            };
+        }
+        scalars! {
+            Bool => pop_bool,
+            I8 => pop_i8,
+            I16 => pop_i16,
+            I32 => pop_i32,
+            I64 => pop_i64,
+            I128 => pop_i128,
+            U8 => pop_u8,
+            U16 => pop_u16,
+            U32 => pop_u32,
+            U64 => pop_u64,
+            U128 => pop_u128,
+            F32 => pop_f32,
+            F64 => pop_f64,
+            Char => pop_char,
+        }
+        Ok(Element::Cursor(Self {
+            schema: self.schema,
+            node,
+            trace: self.tail.pop_trace_node()?,
+            data: self.tail.get(),
+            tail: self.tail,
+        }))
+    }
+
     #[inline]
     fn traced_child<ErrorT>(&self, node: SchemaNodeIndex, trace: TraceNode) -> Result<Self, ErrorT>
     where
@@ -130,7 +177,7 @@ impl<'a> TraceCursor<'a> {
     where
         S: Serializer,
     {
-        self.pop_child(inner)?.serialize(serializer)
+        self.pop_element(inner)?.serialize(serializer)
     }
 
     #[inline]
@@ -147,7 +194,7 @@ impl<'a> TraceCursor<'a> {
 
         let mut serializer = serializer.serialize_tuple(length)?;
         for &node in node_list {
-            serializer.serialize_element(&self.pop_child(node)?)?
+            serializer.serialize_element(&self.pop_element(node)?)?
         }
         serializer.end()
     }
@@ -165,8 +212,8 @@ impl<'a> TraceCursor<'a> {
     {
         let mut serializer = serializer.serialize_map(Some(length))?;
         for _ in 0..length {
-            serializer.serialize_key(&self.pop_child(key)?)?;
-            serializer.serialize_value(&self.pop_child(value)?)?;
+            serializer.serialize_key(&self.pop_element(key)?)?;
+            serializer.serialize_value(&self.pop_element(value)?)?;
         }
         serializer.end()
     }
@@ -181,11 +228,105 @@ impl<'a> TraceCursor<'a> {
     where
         S: Serializer,
     {
+        let item_node = self.schema.node(item).map_err(S::Error::custom)?;
         let mut serializer = serializer.serialize_seq(Some(length))?;
+
+        // Sequences of scalars: take all the elements off the trace at once and read each one
+        // directly instead of going through a cursor.
+        macro_rules! scalar_items {
+            ($($node:ident: $ty:ty => |$bytes:ident| $value:expr,)+) => {
+                match item_node {
+                    $(
+                        SchemaNode::$node => {
+                            const SIZE: usize = 1 + std::mem::size_of::<$ty>();
+                            let items = self.tail.pop_slice::<S::Error>(
+                                length
+                                    .checked_mul(SIZE)
+                                    .ok_or_else(|| S::Error::custom("unexpected end of trace"))?,
+                            )?;
+                            for item in items.chunks_exact(SIZE) {
+                                let (&kind, $bytes) = item.split_first().expect("impossible");
+                                if kind != u8::from(TraceNodeKind::$node) {
+                                    return Err(S::Error::custom("schema-trace mismatch"));
+                                }
+                                let $bytes: [u8; SIZE - 1] = $bytes.try_into().expect("impossible");
+                                serializer.serialize_element(&$value)?;
+                            }
+                            return serializer.end();
+                        }
+                    )+
+                    _ => {}
+                }
+            };
+        }
+        scalar_items! {
+            Bool: u8 => |bytes| bytes[0] != 0,
+            I8: i8 => |bytes| i8::from_le_bytes(bytes),
+            I16: i16 => |bytes| i16::from_le_bytes(bytes),
+            I32: i32 => |bytes| i32::from_le_bytes(bytes),
+            I64: i64 => |bytes| i64::from_le_bytes(bytes),
+            I128: i128 => |bytes| i128::from_le_bytes(bytes),
+            U8: u8 => |bytes| bytes[0],
+            U16: u16 => |bytes| u16::from_le_bytes(bytes),
+            U32: u32 => |bytes| u32::from_le_bytes(bytes),
+            U64: u64 => |bytes| u64::from_le_bytes(bytes),
+            U128: u128 => |bytes| u128::from_le_bytes(bytes),
+            F32: f32 => |bytes| f32::from_le_bytes(bytes),
+            F64: f64 => |bytes| f64::from_le_bytes(bytes),
+            Char: u32 => |bytes| char::try_from(u32::from_le_bytes(bytes))
+                .map_err(|_| S::Error::custom("bad char in trace"))?,
+        }
+
+        // Sequences of structs without skippable or bottom-typed fields: every element has the
+        // same header, compared as bytes, and serializes its fields in order.
+        if let SchemaNode::Struct(name, name_list_index, skip_list, node_list) = item_node
+            && skip_list.is_empty()
+        {
+            let node_list = self.schema.node_list(node_list).map_err(S::Error::custom)?;
+            let name_list = self
+                .schema
+                .field_name_list(name_list_index)
+                .map_err(S::Error::custom)?;
+            if name_list.len() == node_list.len() && !node_list.iter().any(IsEmpty::is_empty) {
+                let mut header = [0; 17];
+                header[0] = TraceNodeKind::Struct.into();
+                header[1..5].copy_from_slice(&u32::from(name).to_le_bytes());
+                header[5..9].copy_from_slice(&u32::from(name_list_index).to_le_bytes());
+                header[9..13].copy_from_slice(
+                    &u32::try_from(node_list.len())
+                        .map_err(|_| S::Error::custom("too many fields"))?
+                        .to_le_bytes(),
+                );
+                header[13..17].copy_from_slice(&ALL_FIELDS_PRESENT.to_le_bytes());
+                for _ in 0..length {
+                    if self.tail.pop_slice::<S::Error>(header.len())? != header {
+                        return Err(S::Error::custom("schema-trace mismatch"));
+                    }
+                    serializer.serialize_element(&FieldsSerializer {
+                        cursor: self,
+                        node_list,
+                    })?;
+                }
+                return serializer.end();
+            }
+        }
+
         for _ in 0..length {
             serializer.serialize_element(&self.pop_child(item)?)?;
         }
         serializer.end()
+    }
+
+    #[inline]
+    fn expect_trace_kind<ErrorT>(&self, kind: TraceNodeKind) -> Result<(), ErrorT>
+    where
+        ErrorT: serde::ser::Error,
+    {
+        if self.tail.pop_u8::<ErrorT>()? == u8::from(kind) {
+            Ok(())
+        } else {
+            Err(ErrorT::custom("schema-trace mismatch"))
+        }
     }
 
     #[inline]
@@ -209,14 +350,49 @@ impl<'a> TraceCursor<'a> {
             .field_name_list(name_list)
             .map_err(S::Error::custom)?;
         let length = self.tail.pop_length_u32()?;
-        let presence = self.tail.pop_slice(length * std::mem::size_of::<u32>())?;
+        let presence_offset = self.tail.pop_u32()?;
         if name_list.len() != node_list.len() {
             return Err(S::Error::custom(
                 "field name - field type length mismatch in schema",
             ));
         }
+        let presence_size = length * std::mem::size_of::<u32>();
 
-        ChunkedEnum::serializable(
+        // Without skippable fields every field that isn't bottom-typed (never serialized) is
+        // present, in order: no discriminant, and no need to read the presence list.
+        if skip_list.is_empty() {
+            if node_list.iter().filter(|node| !node.is_empty()).count() != length {
+                return Err(S::Error::custom("schema-trace mismatch"));
+            }
+            let mut serializer = serializer.serialize_tuple(length)?;
+            for &node in node_list {
+                if !node.is_empty() {
+                    serializer.serialize_element(&self.pop_element(node)?)?;
+                }
+            }
+            if presence_offset != ALL_FIELDS_PRESENT {
+                // Bottom-typed fields were skipped.
+                self.tail.pop_slice(presence_size)?;
+            }
+            return serializer.end();
+        }
+
+        let presence = if presence_offset == ALL_FIELDS_PRESENT {
+            if length != node_list.len() {
+                return Err(S::Error::custom("schema-trace mismatch"));
+            }
+            Presence::All(length)
+        } else {
+            let offset = usize::try_from(presence_offset).expect("usize must be at least 32 bits");
+            Presence::Listed(
+                self.tail
+                    .get()
+                    .get(offset..)
+                    .and_then(|rest| rest.get(..presence_size))
+                    .ok_or_else(|| S::Error::custom("unexpected end of trace"))?,
+            )
+        };
+        let ok = ChunkedEnum::serializable(
             skip_list.len(),
             discriminant_from_presence(skip_list, presence),
             &SkippableStructSerializer {
@@ -225,7 +401,13 @@ impl<'a> TraceCursor<'a> {
                 node_list,
             },
         )?
-        .serialize(serializer)
+        .serialize(serializer)?;
+        if let Presence::Listed(listed) = presence
+            && !std::ptr::eq(self.tail.pop_slice(presence_size)?, listed)
+        {
+            return Err(S::Error::custom("schema-trace mismatch"));
+        }
+        Ok(ok)
     }
 
     // Checks whether the trace matches the schema node.
@@ -426,9 +608,121 @@ impl<'a> TraceCursor<'a> {
     }
 }
 
+/// The fields of a struct without skippable or bottom-typed fields, as a tuple.
+struct FieldsSerializer<'a, 'v> {
+    cursor: &'v TraceCursor<'a>,
+    node_list: &'a [SchemaNodeIndex],
+}
+
+impl Serialize for FieldsSerializer<'_, '_> {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut serializer = serializer.serialize_tuple(self.node_list.len())?;
+        for &node in self.node_list {
+            serializer.serialize_element(&self.cursor.pop_element(node)?)?;
+        }
+        serializer.end()
+    }
+}
+
+/// A value in a sequence, tuple, struct, map or option: a scalar read off the trace, or a
+/// cursor for anything else.
+enum Element<'a> {
+    Scalar(Scalar),
+    Cursor(TraceCursor<'a>),
+}
+
+impl Serialize for Element<'_> {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Element::Scalar(scalar) => scalar.serialize(serializer),
+            Element::Cursor(cursor) => cursor.serialize(serializer),
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum Scalar {
+    Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    I128(i128),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    U128(u128),
+    F32(f32),
+    F64(f64),
+    Char(char),
+}
+
+impl Serialize for Scalar {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match *self {
+            Scalar::Bool(value) => serializer.serialize_bool(value),
+            Scalar::I8(value) => serializer.serialize_i8(value),
+            Scalar::I16(value) => serializer.serialize_i16(value),
+            Scalar::I32(value) => serializer.serialize_i32(value),
+            Scalar::I64(value) => serializer.serialize_i64(value),
+            Scalar::I128(value) => serializer.serialize_i128(value),
+            Scalar::U8(value) => serializer.serialize_u8(value),
+            Scalar::U16(value) => serializer.serialize_u16(value),
+            Scalar::U32(value) => serializer.serialize_u32(value),
+            Scalar::U64(value) => serializer.serialize_u64(value),
+            Scalar::U128(value) => serializer.serialize_u128(value),
+            Scalar::F32(value) => serializer.serialize_f32(value),
+            Scalar::F64(value) => serializer.serialize_f64(value),
+            Scalar::Char(value) => serializer.serialize_char(value),
+        }
+    }
+}
+
+/// The serialized fields of a struct that has skippable fields.
+#[derive(Copy, Clone)]
+enum Presence<'a> {
+    /// No field was skipped: all of this many.
+    All(usize),
+    /// The indices of the serialized fields, from the trace.
+    Listed(&'a [u8]),
+}
+
+impl<'a> Presence<'a> {
+    #[inline]
+    fn len(self) -> usize {
+        match self {
+            Presence::All(length) => length,
+            Presence::Listed(listed) => listed.len() / std::mem::size_of::<u32>(),
+        }
+    }
+
+    #[inline]
+    fn fields(self) -> impl DoubleEndedIterator<Item = MemberIndex> + 'a {
+        let (all, listed) = match self {
+            Presence::All(length) => (0..length, &[][..]),
+            Presence::Listed(listed) => (0..0, listed),
+        };
+        all.map(|field| MemberIndex::from(u32::try_from(field).expect("field index fits u32")))
+            .chain(iter_field_indices(listed))
+    }
+}
+
 struct SkippableStructSerializer<'a, 'v> {
     cursor: &'v TraceCursor<'a>,
-    presence: &'a [u8],
+    presence: Presence<'a>,
     node_list: &'a [SchemaNodeIndex],
 }
 
@@ -437,10 +731,9 @@ impl<'a, 'v> Serialize for SkippableStructSerializer<'a, 'v> {
     where
         S: Serializer,
     {
-        let mut serializer =
-            serializer.serialize_tuple(self.presence.len() / std::mem::size_of::<u32>())?;
-        for field in iter_field_indices(self.presence) {
-            serializer.serialize_element(&self.cursor.pop_child(
+        let mut serializer = serializer.serialize_tuple(self.presence.len())?;
+        for field in self.presence.fields() {
+            serializer.serialize_element(&self.cursor.pop_element(
                 *self.node_list.get(usize::from(field)).ok_or_else(|| {
                     S::Error::custom("member index out of bounds for struct in schema")
                 })?,
@@ -450,9 +743,9 @@ impl<'a, 'v> Serialize for SkippableStructSerializer<'a, 'v> {
     }
 }
 
-fn discriminant_from_presence(skip_list: &[MemberIndex], presence: &[u8]) -> u64 {
+fn discriminant_from_presence(skip_list: &[MemberIndex], presence: Presence<'_>) -> u64 {
     let mut discriminant = 0u64;
-    let mut presence = iter_field_indices(presence).rev().peekable();
+    let mut presence = presence.fields().rev().peekable();
     for &skip in skip_list.iter().rev() {
         discriminant <<= 1;
         while let Some(&present) = presence.peek() {

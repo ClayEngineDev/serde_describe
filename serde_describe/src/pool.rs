@@ -1,12 +1,76 @@
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
-use std::{borrow::Borrow, hash::Hash, marker::PhantomData};
+use std::{
+    borrow::Borrow,
+    hash::{BuildHasher, BuildHasherDefault, Hash, Hasher},
+    marker::PhantomData,
+};
 
 use crate::indices::{IndexIsEmpty, IsEmpty};
 
+/// The hasher of the pools filled while tracing. Their values come from the traced types (names,
+/// schema nodes, lists of indices), not from the traced values, so a fast non-cryptographic hash
+/// is fine.
+pub(crate) type FastState = BuildHasherDefault<FastHasher>;
+
+/// FxHash-style hasher, see [`FastState`].
+#[derive(Default, Clone, Copy)]
+pub(crate) struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            self.write_u64(u64::from_le_bytes(word.try_into().expect("8 bytes")));
+        }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut word = [0; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.write_u64(u64::from_le_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.write_u64(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    #[inline]
+    fn write_isize(&mut self, value: isize) {
+        self.write_u64(value as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Pool<ValueT, ValueIndexT> {
-    inner: IndexSet<ValueT>,
+    inner: IndexSet<ValueT, FastState>,
     _dummy: PhantomData<ValueIndexT>,
 }
 
@@ -50,12 +114,12 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct NonEmptyPool<ValueT, ValueIndexT> {
-    inner: IndexSet<ValueT>,
+pub(crate) struct NonEmptyPool<ValueT, ValueIndexT, HasherT = FastState> {
+    inner: IndexSet<ValueT, HasherT>,
     _dummy: PhantomData<ValueIndexT>,
 }
 
-impl<ValueT, ValueIndexT> Default for NonEmptyPool<ValueT, ValueIndexT> {
+impl<ValueT, ValueIndexT, HasherT: Default> Default for NonEmptyPool<ValueT, ValueIndexT, HasherT> {
     #[inline]
     fn default() -> Self {
         Self {
@@ -65,23 +129,14 @@ impl<ValueT, ValueIndexT> Default for NonEmptyPool<ValueT, ValueIndexT> {
     }
 }
 
-impl<ValueT, ValueIndexT> NonEmptyPool<ValueT, ValueIndexT>
+impl<ValueT, ValueIndexT, HasherT> NonEmptyPool<ValueT, ValueIndexT, HasherT>
 where
     ValueT: Hash + Eq,
     ValueIndexT: TryFrom<usize>,
+    HasherT: BuildHasher,
 {
     pub(crate) fn intern(&mut self, value: ValueT) -> Result<ValueIndexT, ValueIndexT::Error> {
         ValueIndexT::try_from(self.inner.insert_full(value).0)
-    }
-
-    pub(crate) fn intern_from<FromT>(
-        &mut self,
-        value: FromT,
-    ) -> Result<ValueIndexT, ValueIndexT::Error>
-    where
-        ValueT: From<FromT>,
-    {
-        ValueIndexT::try_from(self.inner.insert_full(value.into()).0)
     }
 }
 
@@ -152,13 +207,13 @@ where
     }
 }
 
-impl<FromT, IntoT, ValueIndexT> From<NonEmptyPool<FromT, ValueIndexT>>
+impl<FromT, IntoT, ValueIndexT, HasherT> From<NonEmptyPool<FromT, ValueIndexT, HasherT>>
     for ReadonlyNonEmptyPool<IntoT, ValueIndexT>
 where
     FromT: Into<IntoT>,
 {
     #[inline]
-    fn from(value: NonEmptyPool<FromT, ValueIndexT>) -> Self {
+    fn from(value: NonEmptyPool<FromT, ValueIndexT, HasherT>) -> Self {
         Self {
             values: value.inner.into_iter().map(Into::into).collect(),
             _dummy: PhantomData,
