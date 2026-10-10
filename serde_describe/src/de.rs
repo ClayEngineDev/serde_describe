@@ -723,22 +723,38 @@ where
                 .deserialize_unit(serde::de::IgnoredAny)
                 .and_then(|_| visitor.visit_none()),
             SchemaNode::OptionSome(inner) => visitor.visit_some(self.forward(inner)?),
-            SchemaNode::Unit | SchemaNode::UnitStruct(_) | SchemaNode::UnitVariant(_, _) => {
-                self.deserialize_unit(visitor)
+            SchemaNode::Unit | SchemaNode::UnitStruct(_) => self.deserialize_unit(visitor),
+
+            // Enum variants take the shape self-describing formats give them (`serde_json::Value`,
+            // serde's `Content`): a unit variant is its name, any other variant is a map with the
+            // name as its single key. `deserialize_any` callers that buffer (internally tagged,
+            // untagged, flatten) and later decode an enum from the buffer accept only these two
+            // shapes; a bare unit, newtype or sequence loses the variant name.
+            SchemaNode::UnitVariant(_, variant) => {
+                let name = self.variant_name_deserializer::<Self::Error>(variant)?;
+                self.deserialize_unit(IgnoredAny)?;
+                name.deserialize_any(visitor)
+            }
+            SchemaNode::NewtypeVariant(_, variant, inner) => visitor.visit_map(VariantMapAccess {
+                name: Some(self.variant_name_deserializer(variant)?),
+                value: Some(VariantValue::Newtype(self.forward(inner)?)),
+            }),
+            SchemaNode::TupleVariant(_, variant, _)
+            | SchemaNode::StructVariant(_, variant, _, _, _) => {
+                visitor.visit_map(VariantMapAccess {
+                    name: Some(self.variant_name_deserializer(variant)?),
+                    value: Some(VariantValue::Fields(VariantFields(self))),
+                })
             }
 
-            SchemaNode::NewtypeStruct(_, inner) | SchemaNode::NewtypeVariant(_, _, inner) => {
-                visitor.visit_newtype_struct(self.forward(inner)?)
-            }
+            // Newtype structs are transparent, as in self-describing formats.
+            SchemaNode::NewtypeStruct(_, inner) => self.forward(inner)?.deserialize_any(visitor),
             SchemaNode::Sequence(item) => self.do_deserialize_seq(item, visitor),
             SchemaNode::Map(key, value) => self.do_deserialize_map(key, value, visitor),
-            SchemaNode::Tuple(field_types)
-            | SchemaNode::TupleStruct(_, field_types)
-            | SchemaNode::TupleVariant(_, _, field_types) => {
+            SchemaNode::Tuple(field_types) | SchemaNode::TupleStruct(_, field_types) => {
                 self.do_deserialize_tuple(field_types, visitor)
             }
-            SchemaNode::Struct(_, field_names, skip_list, field_types)
-            | SchemaNode::StructVariant(_, _, field_names, skip_list, field_types) => {
+            SchemaNode::Struct(_, field_names, skip_list, field_types) => {
                 self.do_deserialize_struct(field_names, skip_list, field_types, None, visitor)
             }
             SchemaNode::Union(variants) => {
@@ -1635,6 +1651,89 @@ where
             .ok_or_else(|| Self::Error::custom("more struct keys than values"))?;
 
         Ok(Some((key, value)))
+    }
+}
+
+/// A non-unit enum variant seen through `deserialize_any`: a map whose single key is the variant
+/// name and whose value is the variant's data.
+struct VariantMapAccess<'schema, DeserializerT, ErrorT> {
+    name: Option<NameDeserializer<'schema, ErrorT>>,
+    value: Option<VariantValue<'schema, DeserializerT>>,
+}
+
+enum VariantValue<'schema, DeserializerT> {
+    /// Already forwarded to the payload.
+    Newtype(SchemaDeserializer<'schema, DeserializerT>),
+    Fields(VariantFields<'schema, DeserializerT>),
+}
+
+impl<'s, 'de, DeserializerT> MapAccess<'de>
+    for VariantMapAccess<'s, DeserializerT, DeserializerT::Error>
+where
+    DeserializerT: Deserializer<'de>,
+{
+    type Error = DeserializerT::Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        self.name
+            .take()
+            .map(|name| seed.deserialize(name))
+            .transpose()
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        match self.value.take() {
+            Some(VariantValue::Newtype(payload)) => seed.deserialize(payload),
+            Some(VariantValue::Fields(fields)) => seed.deserialize(fields),
+            None => Err(Self::Error::custom("enum variant value read twice")),
+        }
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(usize::from(self.value.is_some()))
+    }
+}
+
+/// The data of a tuple or struct variant, without the variant name: a sequence or a struct.
+/// Calling `deserialize_any` on the variant node itself would yield the name map again.
+struct VariantFields<'schema, DeserializerT>(SchemaDeserializer<'schema, DeserializerT>);
+
+impl<'s, 'de, DeserializerT> Deserializer<'de> for VariantFields<'s, DeserializerT>
+where
+    DeserializerT: Deserializer<'de>,
+{
+    type Error = DeserializerT::Error;
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        let variant = self.0;
+        match variant.node {
+            SchemaNode::TupleVariant(_, _, field_types) => {
+                variant.do_deserialize_tuple(field_types, visitor)
+            }
+            SchemaNode::StructVariant(_, _, field_names, skip_list, field_types) => {
+                variant.do_deserialize_struct(field_names, skip_list, field_types, None, visitor)
+            }
+            _ => variant.invalid_type_error(&visitor),
+        }
+    }
+
+    fn is_human_readable(&self) -> bool {
+        self.0.inner.is_human_readable()
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map struct enum identifier ignored_any
     }
 }
 

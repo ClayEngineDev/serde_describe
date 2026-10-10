@@ -791,6 +791,7 @@ dependencies = [
  "ron",
  "serde",
  "serde_bytes",
+ "serde_json",
 ]
 
 [[package]]

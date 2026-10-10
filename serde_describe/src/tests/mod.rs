@@ -1,4 +1,5 @@
 pub(crate) mod corruption;
+pub(crate) mod enums_in_any;
 pub(crate) mod evolution;
 pub(crate) mod fast_paths;
 pub(crate) mod helpers;

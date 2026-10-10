@@ -20,6 +20,7 @@ maplit.workspace = true
 postcard.workspace = true
 ron.workspace = true
 serde_bytes.workspace = true
+serde_json.workspace = true
 
 [features]
 # Decode structs whose written fields exactly match the target's declared fields (same
